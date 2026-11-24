@@ -207,13 +207,26 @@ W load_impl(sycl::queue & q, const GgufFile & f, const std::string & name, bool 
     return w;
 }
 
+// file pages already copied, dropped about every GiB (device uploads read the mapping asynchronously, so each
+// batch waits for the queue once; per tensor that made start-up 2.5x slower)
+std::vector<std::pair<const uint8_t *, size_t>> g_release;
+size_t g_release_bytes = 0;
+void release_now(sycl::queue & q, const GgufFile & f) {
+    if (g_release.empty()) return;
+    q.wait();
+    for (auto & [p, n] : g_release) f.release(p, n);
+    g_release.clear();
+    g_release_bytes = 0;
+}
+void release_later(sycl::queue & q, const GgufFile & f, const uint8_t * p, size_t n) {
+    g_release.emplace_back(p, n);
+    if ((g_release_bytes += n) >= (1ull << 30)) release_now(q, f);
+}
+
 W load(sycl::queue & q, const GgufFile & f, const std::string & name, bool required, uint64_t & total,
        std::vector<void *> & allocs, bool repack, bool host = false, uint64_t * host_total = nullptr) {
     W w = load_impl(q, f, name, required, total, allocs, repack, host, host_total);
-    if (const GgufTensor * t = f.tensor(name)) {
-        q.wait();  // device uploads read the mapping asynchronously
-        f.release(t->data, t->n_bytes);
-    }
+    if (const GgufTensor * t = f.tensor(name)) release_later(q, f, t->data, t->n_bytes);
     return w;
 }
 
@@ -410,6 +423,7 @@ Model::Model(sycl::queue & q, const GgufFile & f, bool repack) : q_(q) {
         }
     }
     schedule = make_schedule(hp);
+    release_now(q_, f);  // the last batch of copied file pages
     q_.wait();
 }
 
