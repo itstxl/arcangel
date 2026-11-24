@@ -118,15 +118,30 @@ oneAPI 2026.0, Unsloth UD-Q2_K_XL. Run-to-run noise is about ±10% on short runs
 | Speculative decoding on the prompt path (`verify`, kept, off) | 115-150 ms per verify of 1-16 tokens (7-9 decode steps): every expert's weights are decoded; needs small-batch expert kernels |
 | llama.cpp SYCL backend, Strata 0.2.19/0.2.20, arcint | slower than llama.cpp Vulkan or cannot run the formats |
 
-## Speculative decoding (2026-11-24, not enabled)
+## Speculative decoding (2026-11-24: measured, simulated, not built)
 
-Measured on 37 traced opencode requests (16k generated tokens, `ARCANGEL_TRACE` + `bench/draft_sim.py`):
-copying from the context (prompt lookup, 4/3/2-token match) would give 1.90 / 2.08 / 2.18 tokens per step with
-4 / 8 / 16 drafted tokens; tool calls that repeat code reach 2.5-7. `FastEngine::verify` + `commit` exist and
-match one-at-a-time decoding (`test-verify`), but on the prompt path a verify costs 7-9 decode steps. The way
-to make it pay is a small-batch decode path where each expert's rows are read once for all the tokens routed
-to it; on this MoE, 5-9 tokens touch roughly 3-6x the experts of one, so the expected gain is ~10-25% on
-edits and little on new text.
+Copy drafting (prompt lookup) on 37 traced opencode requests (16k generated tokens, `ARCANGEL_TRACE` +
+`bench/draft_sim.py`): 1.90 / 2.08 / 2.18 tokens per step with 4 / 8 / 16 drafted tokens; tool calls that
+repeat code reach 2.5-7.
+
+Why that is not a 2x: in a MoE only the experts the batched tokens share are read once. Distinct experts per
+offloaded layer among T consecutive tokens (opencode routing): T=2 82%, 3 73%, 4 66%, 8 51% of the reads of
+T separate steps. Only the dense layers and the head (~1/5 of a step) are shared fully. With those costs
+(`bench/spec_sim.py`, B580):
+
+| Drafting policy | offload setup | full VRAM |
+|---|---|---|
+| draft 4 whenever any 2-token match | 0.96x | 0.98x |
+| draft 4 when the last 8+ tokens match | 1.16x | 1.17x |
+| draft 8 when the last 8+ tokens match | 1.18x | 1.17x |
+
+The gain is on copying stretches (file rewrites, quoted code: ~1.5-2x there), nothing elsewhere. Deferred in
+favour of the decode expert kernels (every token). What exists: `FastEngine::verify` + `commit` (batch through
+the prompt path, rollback of the convolution history; `test-verify` checks both), but the prompt path costs
+7-9 decode steps per verify (XMX tiles; the non-XMX fallback is slower still, 168 ms for 1 token). Building it
+needs a batched decode path: per-token buffers and positions, sequential convolution with rollback, expert
+kernels grouped by expert (shared experts read once), a batched CPU-expert path, a graph per batch size, and
+the drafting / acceptance loop in the server.
 
 ## Offload setup (2026-11-24, UD-Q4_K_XL on the B580)
 

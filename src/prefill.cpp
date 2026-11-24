@@ -1271,6 +1271,11 @@ const std::vector<float> & FastEngine::verify(const std::vector<int> & tokens, i
     }
     verify_ = true;
     vn_ = n;
+    // small batches: the matrix-vector kernels (weights read once for all tokens), not the XMX tiles (built
+    // for 1024-token chunks; INK_VERIFY_XMX=1 to compare)
+    const bool xmx_saved = use_xmx;
+    static const bool vx = getenv("INK_VERIFY_XMX") && std::string(getenv("INK_VERIFY_XMX")) == "1";
+    use_xmx = vx;
     try {
         q_.memcpy(btok_, tokens.data(), n * sizeof(int32_t));
         embed(n);
@@ -1297,9 +1302,11 @@ const std::vector<float> & FastEngine::verify(const std::vector<int> & tokens, i
         for (int r = 0; r < n; ++r) run_bmm("b_head", {bjob(m_.output, bf_ + (size_t) r * D, D, vlogits_ + (size_t) r * h.n_vocab, 0)}, 1);
     } catch (...) {
         verify_ = false;
+        use_xmx = xmx_saved;
         throw;
     }
     verify_ = false;
+    use_xmx = xmx_saved;
     reload_cache();
     vlogits_host_.resize((size_t) n * h.n_vocab);
     q_.memcpy(vlogits_host_.data(), vlogits_, vlogits_host_.size() * sizeof(float)).wait();
