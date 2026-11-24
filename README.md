@@ -87,14 +87,17 @@ Measured on the B580 (Ryzen 5 5600X, 32 GB DDR4):
 
 | | Full VRAM (Q2_K_XL) | Offload (Q4_K_XL) |
 |---|---|---|
-| Generation, short context | 62-65 tok/s | 32 tok/s |
-| Generation at 30k | 56 tok/s | 29-32 tok/s |
+| Generation, short context | 62-65 tok/s | 36-37 tok/s |
+| Generation at 30k | 56 tok/s | ~35 tok/s |
 | Prompt reading, 4k / 20k | 900 / ~800 tok/s | 368 / ~290 tok/s |
 | Weights in VRAM / in RAM | 8.5 / 0 GiB | 8.1 / 8.3 GiB |
 
-Where the offload setup's time goes: per token, the GPU works ~15 ms and the CPU ~14 ms reading 0.53 GB of
-experts from RAM at ~37 GB/s, which is what dual-channel DDR4 delivers. Faster RAM (DDR5) speeds it up
-directly. Switch setups any time with `./install.sh --card <card> --setup vram|offload`.
+How the offload setup works: per token the GPU does the dense layers and the looped layers' experts (~15 ms
+on a B580), the CPU the offloaded experts, reading them from RAM at ~37 GB/s (what dual-channel DDR4
+delivers; DDR5 speeds this half up directly). The spare VRAM holds a cache of each offloaded layer's most-used
+experts (13 of 128 per layer on a B580 at 96k; `ARCANGEL_EXPERT_CACHE_MB` to set it): the GPU computes the
+cached ones at the same time as the CPU does the rest, which took CPU time per token from ~14 to ~10 ms on
+real opencode traffic. The cache follows what the model actually routes to, refreshed every 256 tokens. Switch setups any time with `./install.sh --card <card> --setup vram|offload`.
 
 The profiles live in [cards.tsv](cards.tsv). Only the B580 has run them. The others were sized from each
 card's memory: weights, plus the K/V cache, plus prompt buffers, plus a 0.5 GB margin, plus about 1 GB for a

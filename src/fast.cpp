@@ -950,7 +950,7 @@ FastEngine::FastEngine(sycl::queue & q, const Model & m, int n_ctx, bool use_gra
         gcoef_ = dev<float>(8);
         gsc_ = dev<float>(8);
         ygpu_ = dev<float>(D);
-        // hot-expert cache: ARCANGEL_EXPERT_CACHE_MB, else the free VRAM above a 1 GiB reserve (the desktop's
+        // hot-expert cache: ARCANGEL_EXPERT_CACHE_MB, else the free VRAM above a 768 MiB reserve (the desktop's
         // use moves around), as the same number of slots in every CPU-expert layer
         auto expert_bytes = [&](const W & w, int rows) {
             return (size_t) rows * (w.row_bytes + w.aux_row_bytes + w.aux2_row_bytes);
@@ -963,7 +963,7 @@ FastEngine::FastEngine(sycl::queue & q, const Model & m, int n_ctx, bool use_gra
             budget = (size_t) atoll(e) << 20;
         } else {
             const DeviceInfo di = describe(q_.get_device());
-            budget = di.free_bytes > (1536ull << 20) ? di.free_bytes - (1536ull << 20) : 0;
+            budget = di.free_bytes > (768ull << 20) ? di.free_bytes - (768ull << 20) : 0;
         }
         cache_slots_ = per_slot ? (int) std::min<size_t>(h.n_expert, budget / per_slot) : 0;
         ecache_.resize(h.n_layer);

@@ -128,6 +128,22 @@ to make it pay is a small-batch decode path where each expert's rows are read on
 to it; on this MoE, 5-9 tokens touch roughly 3-6x the experts of one, so the expected gain is ~10-25% on
 edits and little on new text.
 
+## Offload setup (2026-11-24, UD-Q4_K_XL on the B580)
+
+- Placement: the 12 single-pass layers' experts (8.3 GiB) in pinned RAM: half of the expert bytes, a quarter
+  of the per-token expert reads (the loop core runs 3x). GPU weights 8.1 GiB, less than Q2_K_XL's 8.5.
+- GPU reading the experts over PCIe: ~6-9 GB/s, decode ~11-17 tok/s. CPU computing them (AVX2 int8): 0.53
+  GB per token at ~37 GB/s (DDR4 dual channel, 6 threads; 3 threads slower, 12 no faster): 32 tok/s.
+- Hot-expert cache: routing in the offloaded layers is skewed (top 8 / 16 / 32 of 128 experts per layer
+  serve 29 / 44 / 64% of activations on opencode traffic; a recency cache does worse than frequency). The
+  cached chosen experts run on the GPU concurrently with the CPU: CPU 13.9 -> 9.9 ms per token at 8 slots,
+  36-37 tok/s. Auto size = free VRAM above 768 MiB (13 slots at 96k).
+- Pitfalls found: q.memcpy between two host buffers goes through driver staging (minutes for 8 GiB: use
+  memcpy); with vm.swappiness 150 the model file's page cache made the kernel swap the experts out, so the
+  GPU's reads stalled (prompt reading > 5 min for 4k tokens): the loader drops copied file pages when
+  offloading; a Q8_0 embedding was repacked but read in the file layout (garbage, then a GPU hang).
+- Prompt reading: 368-385 tok/s at 4k (the GPU reads each chunk's offloaded experts over PCIe).
+
 ## KV cache
 
 Selectable: `--kv-bits 8` (int8) or `4` (default in the service, 96k context); layout head-major
