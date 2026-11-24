@@ -190,6 +190,10 @@ void CpuExperts::run(const W & gu, const float * gscale, const W & dn, const flo
     parallel(nu * nff, [&](int b, int e) {
         for (int r = b; r < e; ++r) {
             const int k = r / nff, i = r % nff, ex = ids[k];
+            if (ex < 0) {  // computed on the GPU (hot-expert cache)
+                act_[r] = 0.0f;
+                continue;
+            }
             const float s = gscale ? gscale[ex] : 1.0f;
             const size_t r0 = (size_t) ex * rows_e;
             const float gg = gdot(gu, r0 + i, gcols, xq_.data(), xd_.data()) * s;
@@ -207,6 +211,7 @@ void CpuExperts::run(const W & gu, const float * gscale, const W & dn, const flo
             float acc = 0.0f;
             for (int k = 0; k < nu; ++k) {
                 const int ex = ids[k];
+                if (ex < 0) continue;
                 acc += ddot(dn, (size_t) ex * D + i, dcols, aq_.data() + (size_t) k * dcols, ad_.data() + (size_t) k * dcols / 32) *
                        wts[k] * (dscale ? dscale[ex] : 1.0f);
             }

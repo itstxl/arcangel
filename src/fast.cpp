@@ -1,4 +1,5 @@
 #include "fast.h"
+#include "device.h"
 
 #include "kernels.h"
 #include "quant.h"
@@ -532,6 +533,77 @@ template <uint32_t T, bool STAGE> sycl::event k_down8(sycl::queue & q, const Pro
 
 template <uint32_t T> constexpr bool has_down_q8() { return T == q::NVFP4R || T == q::Q2_0R; }
 
+// ---- hot-expert cache (offload): the chosen experts that are cached in VRAM, computed on the GPU while the CPU
+// computes the others. Routing split: slot (or -1) per chosen expert for the GPU, expert (or -1) for the CPU.
+struct RouteSplitArgs {
+    const int32_t * ids;
+    const float * wts;
+    const int32_t * cmap;  // expert -> slot for this layer
+    const float * gscale, * dscale;
+    int nu;
+    int32_t * gslot;
+    float * gcoef, * gsc;
+    int32_t * hcpu, * hall;  // pinned: the CPU's experts (-1 = cached) and all chosen experts (statistics)
+    float * hwts;
+};
+sycl::event k_route_split(sycl::queue & q, const RouteSplitArgs a) {
+    return q.parallel_for(sycl::range<1>(a.nu), [=](sycl::id<1> id) {
+        const int k = (int) id[0], e = a.ids[k];
+        const int s = a.cmap ? a.cmap[e] : -1;
+        a.gslot[k] = s;
+        a.gcoef[k] = a.wts[k] * (a.dscale ? a.dscale[e] : 1.0f);
+        a.gsc[k] = a.gscale ? a.gscale[e] : 1.0f;
+        a.hcpu[k] = s >= 0 ? -1 : e;
+        a.hall[k] = e;
+        a.hwts[k] = a.wts[k];
+    });
+}
+
+// gate-up + SITU of the cached chosen experts (rows of slot s), act = 0 for the others
+template <uint32_t T> sycl::event k_cache_gate_up(sycl::queue & q, WRef w, int cols, int rows_e, int nff, int nu, const float * f,
+                                                  const int32_t * gslot, const float * gsc, float * act, float beta, float lb) {
+    return q.parallel_for(sycl::nd_range<1>((size_t) nu * nff / RPG * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const q::Tabs tb;
+        const auto sg = it.get_sub_group();
+        const int row = (int) (it.get_group(0) * RPG + sg.get_group_id()[0]);
+        const int k = row / nff, i = row % nff, lane = (int) sg.get_local_id()[0];
+        const int s = gslot[k];
+        if (s < 0) {
+            if (lane == 0) act[row] = 0.0f;
+            return;
+        }
+        const size_t r0 = (size_t) s * rows_e;
+        float gg = lane_dot<T>(row_of(w, r0 + i), cols, f, f, cols, lane, tb);
+        float uu = lane_dot<T>(row_of(w, r0 + nff + i), cols, f, f, cols, lane, tb);
+        gg = sycl::reduce_over_group(sg, gg, sycl::plus<float>()) * gsc[k];
+        uu = sycl::reduce_over_group(sg, uu, sycl::plus<float>()) * gsc[k];
+        if (lane == 0) {
+            const float g = beta * sycl::tanh(gg / beta) * sigmoidf(gg);
+            act[row] = g * (lb > 0.0f ? lb * sycl::tanh(uu / lb) : uu);
+        }
+    });
+}
+
+// down of the cached chosen experts, weighted: y[i] = sum_k coef_k * row(slot_k, i) . act_k
+template <uint32_t T> sycl::event k_cache_down(sycl::queue & q, WRef w, int cols, int nu, const int32_t * gslot, const float * gcoef,
+                                               const float * act, float * y) {
+    return q.parallel_for(sycl::nd_range<1>((size_t) D / RPG * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const q::Tabs tb;
+        const auto sg = it.get_sub_group();
+        const int i = (int) (it.get_group(0) * RPG + sg.get_group_id()[0]);
+        const int lane = (int) sg.get_local_id()[0];
+        float acc = 0.0f;
+        for (int k = 0; k < nu; ++k) {
+            const int s = gslot[k];
+            if (s < 0) continue;
+            const float * xk = act + (size_t) k * cols;
+            acc += lane_dot<T>(row_of(w, (size_t) s * D + i), cols, xk, xk, cols, lane, tb) * gcoef[k];
+        }
+        acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+        if (lane == 0) y[i] = acc;
+    });
+}
+
 // The chosen experts' activations (nu x cols) to int8, one scale per 32 values, plus each block's integer sum.
 // perm (Q2_0R): within each 16-value group store value 4j + r at byte 4r + j, so that the 2-bit field r of
 // each weight byte lines up with word r of the group (see down_unit).
@@ -872,6 +944,52 @@ FastEngine::FastEngine(sycl::queue & q, const Model & m, int n_ctx, bool use_gra
             }
         }
         q_.wait();
+        cmap_ = dev<int32_t>((size_t) h.n_layer * h.n_expert);
+        q_.fill(cmap_, (int32_t) -1, (size_t) h.n_layer * h.n_expert);
+        gslot_ = dev<int32_t>(8);
+        gcoef_ = dev<float>(8);
+        gsc_ = dev<float>(8);
+        ygpu_ = dev<float>(D);
+        // hot-expert cache: ARCANGEL_EXPERT_CACHE_MB, else the free VRAM above a 1 GiB reserve (the desktop's
+        // use moves around), as the same number of slots in every CPU-expert layer
+        auto expert_bytes = [&](const W & w, int rows) {
+            return (size_t) rows * (w.row_bytes + w.aux_row_bytes + w.aux2_row_bytes);
+        };
+        size_t per_slot = 0;
+        for (int ip = 0; ip < h.n_layer; ++ip)
+            if (cpu_layer_[ip]) per_slot += expert_bytes(m.layers[ip].gate_up, (int) m.layers[ip].gate_up.ne[1]) + expert_bytes(m.layers[ip].down, D);
+        size_t budget = 0;
+        if (const char * e = getenv("ARCANGEL_EXPERT_CACHE_MB")) {
+            budget = (size_t) atoll(e) << 20;
+        } else {
+            const DeviceInfo di = describe(q_.get_device());
+            budget = di.free_bytes > (1536ull << 20) ? di.free_bytes - (1536ull << 20) : 0;
+        }
+        cache_slots_ = per_slot ? (int) std::min<size_t>(h.n_expert, budget / per_slot) : 0;
+        ecache_.resize(h.n_layer);
+        if (cache_slots_ > 0) {
+            auto alloc_like = [&](const W & src, int rows_e) {
+                W w = src;
+                const size_t rows = (size_t) cache_slots_ * rows_e;
+                w.p = dev<uint8_t>(rows * src.row_bytes);
+                w.aux = src.aux ? dev<uint8_t>(rows * src.aux_row_bytes) : nullptr;
+                w.aux2 = src.aux2 ? dev<uint8_t>(rows * src.aux2_row_bytes) : nullptr;
+                w.ne[2] = cache_slots_;
+                return w;
+            };
+            for (int ip = 0; ip < h.n_layer; ++ip) {
+                if (!cpu_layer_[ip]) continue;
+                ExpertCache & c = ecache_[ip];
+                c.gu = alloc_like(m.layers[ip].gate_up, (int) m.layers[ip].gate_up.ne[1]);
+                c.dn = alloc_like(m.layers[ip].down, D);
+                c.slot_e.assign(cache_slots_, -1);
+                c.count.assign(h.n_expert, 0.0);
+                for (int sl = 0; sl < cache_slots_; ++sl) c.count[sl] = 1e-3 * (cache_slots_ - sl);  // start: experts 0..S-1
+            }
+            refresh_cache();
+        }
+        std::fprintf(stderr, "offload: %d layers' experts on the CPU (%d threads), hot-expert cache %d of %d experts per layer (%zu MiB VRAM)\n",
+                     cpu_expert_layers(), cpu_->threads(), cache_slots_, h.n_expert, (size_t) cache_slots_ * per_slot >> 20);
     }
     prepare_jobs();
     if (use_graph) build_graph();
@@ -885,6 +1003,7 @@ void FastEngine::split(int ip) {
         rec_->end_recording(q_);
         graphs_.push_back(std::make_unique<ExecGraph>(rec_->finalize()));
         cpu_seq_.push_back(ip);
+        seg_cache_.push_back(0);
         rec_ = std::make_unique<ModGraph>(q_.get_context(), q_.get_device());
         rec_->begin_recording(q_);
     } else {
@@ -893,12 +1012,68 @@ void FastEngine::split(int ip) {
     }
 }
 
+// ends the cached-experts segment: step() submits it right after the CPU-expert split, before the CPU starts
+void FastEngine::split_cache() {
+    if (jobs_only_ || !rec_) return;
+    rec_->end_recording(q_);
+    graphs_.push_back(std::make_unique<ExecGraph>(rec_->finalize()));
+    cpu_seq_.push_back(-1);
+    seg_cache_.push_back(1);
+    rec_ = std::make_unique<ModGraph>(q_.get_context(), q_.get_device());
+    rec_->begin_recording(q_);
+}
+
+// The cache holds each CPU-expert layer's most-routed experts (decayed counts); changed slots are copied from
+// pinned RAM between tokens. The graph keeps its pointers: only the slot contents and cmap_ change.
+void FastEngine::refresh_cache() {
+    const Hparams & h = hp_;
+    if (cache_slots_ <= 0) return;
+    std::vector<int32_t> cmap((size_t) h.n_layer * h.n_expert, -1);
+    for (int ip = 0; ip < h.n_layer; ++ip) {
+        if (!cpu_layer_[ip]) continue;
+        ExpertCache & c = ecache_[ip];
+        const LayerW & L = m_.layers[ip];
+        std::vector<int> order(h.n_expert);
+        for (int e = 0; e < h.n_expert; ++e) order[e] = e;
+        std::partial_sort(order.begin(), order.begin() + cache_slots_, order.end(), [&](int a, int b) { return c.count[a] > c.count[b]; });
+        std::vector<bool> want(h.n_expert, false);
+        for (int j = 0; j < cache_slots_; ++j) want[order[j]] = true;
+        std::vector<bool> have(h.n_expert, false);
+        for (int sl = 0; sl < cache_slots_; ++sl)
+            if (c.slot_e[sl] >= 0 && want[c.slot_e[sl]]) have[c.slot_e[sl]] = true;
+            else c.slot_e[sl] = -1;
+        int next = 0;
+        for (int j = 0; j < cache_slots_; ++j) {
+            const int e = order[j];
+            if (have[e]) continue;
+            while (c.slot_e[next] >= 0) ++next;
+            c.slot_e[next] = e;
+            auto copy = [&](const W & src, const W & dst, int rows_e) {
+                const size_t r = (size_t) rows_e;
+                q_.memcpy((void *) (dst.p + next * r * src.row_bytes), src.p + e * r * src.row_bytes, r * src.row_bytes);
+                if (src.aux) q_.memcpy((void *) (dst.aux + next * r * src.aux_row_bytes), src.aux + e * r * src.aux_row_bytes, r * src.aux_row_bytes);
+                if (src.aux2) q_.memcpy((void *) (dst.aux2 + next * r * src.aux2_row_bytes), src.aux2 + e * r * src.aux2_row_bytes, r * src.aux2_row_bytes);
+            };
+            copy(L.gate_up, c.gu, (int) L.gate_up.ne[1]);
+            copy(L.down, c.dn, D);
+        }
+        for (int sl = 0; sl < cache_slots_; ++sl)
+            if (c.slot_e[sl] >= 0) cmap[(size_t) ip * h.n_expert + c.slot_e[sl]] = sl;
+        for (double & v : c.count) v *= 0.7;  // decay: follow the workload
+    }
+    q_.memcpy(cmap_, cmap.data(), cmap.size() * sizeof(int32_t)).wait();
+}
+
 void FastEngine::cpu_experts(int ip) {
     const Hparams & h = hp_;
     const LayerW & L = m_.layers[ip];
+    if (cache_slots_ > 0) {
+        const int32_t * all = (const int32_t *) (hx_ + D + 32);
+        for (int k = 0; k < h.n_used; ++k) ecache_[ip].count[all[k]] += 1.0;
+    }
     static FILE * route_log = getenv("INK_ROUTE_LOG") ? fopen(getenv("INK_ROUTE_LOG"), "a") : nullptr;  // developer aid
     if (route_log) {
-        const int32_t * ids = (const int32_t *) (hx_ + D);
+        const int32_t * ids = (const int32_t *) (hx_ + D + 32);
         fprintf(route_log, "%d", ip);
         for (int k = 0; k < h.n_used; ++k) fprintf(route_log, " %d", ids[k]);
         fprintf(route_log, "\n");
@@ -911,16 +1086,20 @@ void FastEngine::build_graph() {
     try {
         graphs_.clear();
         cpu_seq_.clear();
+        seg_cache_.clear();
         rec_ = std::make_unique<ModGraph>(q_.get_context(), q_.get_device());
         rec_->begin_recording(q_);
         record();  // split() ends a segment at every CPU-expert layer
         rec_->end_recording(q_);
         graphs_.push_back(std::make_unique<ExecGraph>(rec_->finalize()));
+        cpu_seq_.push_back(-1);
+        seg_cache_.push_back(0);
         rec_.reset();
     } catch (const std::exception & e) {
         std::fprintf(stderr, "fast engine: command graph unavailable (%s), submitting directly\n", e.what());
         graphs_.clear();
         cpu_seq_.clear();
+        seg_cache_.clear();
         rec_.reset();
     }
 }
@@ -1427,14 +1606,30 @@ void FastEngine::visit(const Visit & v) {
     // decode graph ends a segment here, the CPU writes the expert sum to hy_, then the convolution and residual.
     if (cpu_ && cpu_layer_[v.ip]) {
         P("cpu_x", q_.memcpy(hx_, f_, D * sizeof(float)));
-        P("cpu_x", q_.memcpy(hx_ + D, ids_, h.n_used * sizeof(int32_t)));
-        P("cpu_x", q_.memcpy(hx_ + D + 64, wts_, h.n_used * sizeof(float)));
+        RouteSplitArgs ra{ids_, wts_, cache_slots_ > 0 ? cmap_ + (size_t) v.ip * h.n_expert : nullptr,
+                          L.gate_up_s.ok() ? L.gate_up_s.f32() : nullptr, L.down_s.ok() ? L.down_s.f32() : nullptr, h.n_used,
+                          gslot_, gcoef_, gsc_, (int32_t *) (hx_ + D), (int32_t *) (hx_ + D + 32), hx_ + D + 64};
+        P("cpu_x", k_route_split(q_, ra));
         split(v.ip);
-        const float * yv = hy_, * conv = L.ffn_post_conv.f32(), * res = xb_;
+        const bool cached = cache_slots_ > 0;
+        if (cached) {
+            const ExpertCache & c = ecache_[v.ip];
+            dispatch_type(L.gate_up.ktype, [&](auto tag) {
+                constexpr uint32_t T = decltype(tag)::value;
+                P("cache_gate_up", k_cache_gate_up<T>(q_, wref(c.gu), (int) L.gate_up.ne[0], (int) L.gate_up.ne[1], h.n_ff, h.n_used, f_,
+                                                      gslot_, gsc_, act_, h.situ_beta, h.situ_lb));
+            });
+            dispatch_type(L.down.ktype, [&](auto tag) {
+                constexpr uint32_t T = decltype(tag)::value;
+                P("cache_down", k_cache_down<T>(q_, wref(c.dn), (int) L.down.ne[0], h.n_used, gslot_, gcoef_, act_, ygpu_));
+            });
+            split_cache();
+        }
+        const float * yv = hy_, * yg = cached ? ygpu_ : nullptr, * conv = L.ffn_post_conv.f32(), * res = xb_;
         float * hist = hist_[v.slot] + (size_t) (2 * kvw + D) * 3, * out = xa_;
         P("cpu_conv", q_.parallel_for(sycl::range<1>(D), [=](sycl::id<1> id) {
             const int i = (int) id[0];
-            const float y = yv[i];
+            const float y = yv[i] + (yg ? yg[i] : 0.0f);
             float * hh = hist + (size_t) i * 3;
             const float xx[4] = {hh[0], hh[1], hh[2], y};
             float cv = 0.0f;
@@ -1565,10 +1760,11 @@ const std::vector<float> & FastEngine::step(int token, int pos) {
         for (size_t i = 0; i < graphs_.size(); ++i) {
             const auto t0 = clk::now();
             q_.ext_oneapi_graph(*graphs_[i]);
-            if (i < cpu_seq_.size()) {
+            if (cpu_seq_[i] >= 0) {
                 q_.wait();
                 const auto t1 = clk::now();
-                cpu_experts(cpu_seq_[i]);
+                if (i + 1 < graphs_.size() && seg_cache_[i + 1]) q_.ext_oneapi_graph(*graphs_[++i]);  // GPU: cached experts
+                cpu_experts(cpu_seq_[i - seg_cache_[i]]);                                            // CPU: the rest
                 if (tm) {
                     gpu_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
                     cpu_ms += std::chrono::duration<double, std::milli>(clk::now() - t1).count();
@@ -1580,6 +1776,11 @@ const std::vector<float> & FastEngine::step(int token, int pos) {
             static int n = 0;
             g += gpu_ms, c += cpu_ms;
             if (++n % 16 == 0) std::fprintf(stderr, "per token: GPU segments %.2f ms, CPU experts %.2f ms\n", g / n, c / n);
+        }
+        if (cache_slots_ > 0 && ++tokens_since_refresh_ >= (cache_warm_ ? 256 : 32)) {
+            refresh_cache();
+            tokens_since_refresh_ = 0;
+            cache_warm_ = true;
         }
     } else {
         record();

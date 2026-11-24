@@ -157,6 +157,27 @@ private:
     std::vector<std::vector<float>> cpu_gs_, cpu_ds_;  // per layer: the experts' gate-up / down scales (host)
     float * hx_ = nullptr;           // pinned: FFN input (D), then ids (as int32) and weights of the chosen experts
     float * hy_ = nullptr;           // pinned: the CPU's expert sum (D)
+    // hot-expert cache (offload): per CPU-expert layer, the most-used experts copied to VRAM; per token the GPU
+    // computes the chosen experts that are cached while the CPU computes the rest (ARCANGEL_EXPERT_CACHE_MB)
+    struct ExpertCache {
+        W gu, dn;                    // the cached experts' rows, same layouts as the layer's tensors
+        std::vector<int> slot_e;     // slot -> expert (-1: empty)
+        std::vector<double> count;   // routing counts (decayed) per expert
+    };
+    std::vector<ExpertCache> ecache_;  // per physical layer (empty for others)
+    int cache_slots_ = 0;
+    int32_t * cmap_ = nullptr;       // device [n_layer][n_expert]: expert -> slot (-1)
+    int32_t * gslot_ = nullptr;      // device [8]: slot of each chosen expert (-1: on the CPU)
+    float * gcoef_ = nullptr, * gsc_ = nullptr;  // device [8]: routing weight x down scale, gate-up scale
+    float * ygpu_ = nullptr;         // device [D]: the cached experts' sum
+    std::vector<char> seg_cache_;    // per graph segment: 1 = the cached-experts segment (runs during the CPU)
+    void split_cache();
+    void refresh_cache();
+    int tokens_since_refresh_ = 0;
+    bool cache_warm_ = false;
+public:
+    int expert_cache_slots() const { return cache_slots_; }
+private:
     std::vector<float> logits_;
 
     // prompt chunks: token-major [TB_][...] arrays (prefill.cpp)
