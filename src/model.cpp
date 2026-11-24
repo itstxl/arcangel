@@ -211,6 +211,7 @@ W load_impl(sycl::queue & q, const GgufFile & f, const std::string & name, bool 
 // batch waits for the queue once; per tensor that made start-up 2.5x slower)
 std::vector<std::pair<const uint8_t *, size_t>> g_release;
 size_t g_release_bytes = 0;
+bool g_release_on = false;  // only with offloading: otherwise a cached file makes restarts ~2.5x faster
 void release_now(sycl::queue & q, const GgufFile & f) {
     if (g_release.empty()) return;
     q.wait();
@@ -219,6 +220,7 @@ void release_now(sycl::queue & q, const GgufFile & f) {
     g_release_bytes = 0;
 }
 void release_later(sycl::queue & q, const GgufFile & f, const uint8_t * p, size_t n) {
+    if (!g_release_on) return;
     g_release.emplace_back(p, n);
     if ((g_release_bytes += n) >= (1ull << 30)) release_now(q, f);
 }
@@ -365,6 +367,7 @@ Model::Model(sycl::queue & q, const GgufFile & f, bool repack) : q_(q) {
                                      " MiB + 4096 MiB spare, " + std::to_string(avail >> 20) + " MiB available");
     }
 
+    g_release_on = host_need > 0;
     auto L = [&](const std::string & n, bool req = true) {
         return load(q_, f, n, req, weight_bytes, allocs_, repack, is_off(n), &host_bytes);
     };
