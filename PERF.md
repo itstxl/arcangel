@@ -106,7 +106,20 @@ oneAPI 2026.0, Unsloth UD-Q2_K_XL. Run-to-run noise is about ±10% on short runs
 | Decode attention: tree reduction of the P.V partials | slower than local atomics |
 | SWA decode chunk 128 (vs 64) | slower at every depth |
 | SWA decode work-group 64 threads | slower, and broke the output (it writes one dim per thread: now a static_assert) |
+| Decode gate-up (IQ2_S, 187 GB/s): codebook lookups replaced by arithmetic (timing only) | no change: not lookup-bound |
+| Decode gate-up work-group 64 / 128 / 512 threads (256 default) | no change |
+| Speculative decoding on the prompt path (`verify`, kept, off) | 115-150 ms per verify of 1-16 tokens (7-9 decode steps): every expert's weights are decoded; needs small-batch expert kernels |
 | llama.cpp SYCL backend, Strata 0.2.19/0.2.20, arcint | slower than llama.cpp Vulkan or cannot run the formats |
+
+## Speculative decoding (2026-11-24, not enabled)
+
+Measured on 37 traced opencode requests (16k generated tokens, `ARCANGEL_TRACE` + `bench/draft_sim.py`):
+copying from the context (prompt lookup, 4/3/2-token match) would give 1.90 / 2.08 / 2.18 tokens per step with
+4 / 8 / 16 drafted tokens; tool calls that repeat code reach 2.5-7. `FastEngine::verify` + `commit` exist and
+match one-at-a-time decoding (`test-verify`), but on the prompt path a verify costs 7-9 decode steps. The way
+to make it pay is a small-batch decode path where each expert's rows are read once for all the tokens routed
+to it; on this MoE, 5-9 tokens touch roughly 3-6x the experts of one, so the expected gain is ~10-25% on
+edits and little on new text.
 
 ## KV cache
 
