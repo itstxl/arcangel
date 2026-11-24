@@ -80,6 +80,11 @@ oneAPI 2026.0, Unsloth UD-Q2_K_XL. Run-to-run noise is about ±10% on short runs
     latency; all n scores now in one pass (sub-group sums, one local-memory exchange, one barrier): attn/ffn mix
     0.5 -> 0.4 ms per token. The remaining small kernels (~2.5 ms/token over 48 visits) are launch/latency
     bound: kernel fusion is the next lever there.
+16. **Decode P.V at depth was latency-bound, not bandwidth-bound** (2026-11-24): at 90k the full-attention
+    P.V read V at ~74 GB/s (scores read the same bytes at ~170). A lane read 4 bytes (8 dims) of one key per
+    step. Now a sub-group step covers 4 consecutive keys, a lane per (key, 32 dims): 16-byte loads, 256
+    contiguous bytes per load instruction, partial sums folded with two sub-group shuffles. Decode 42.3 ->
+    45.7 tok/s at 90k, 53.7 -> 56.0 at 30k, +1.7% at 2k.
 15. Prompt attention at long context: 27% of a 32k prompt (11.3 s), ~4-5 TFLOPS on the XMX units; larger query
     blocks (QB=32) would halve the per-block K/V staging but need ~130 registers (large-GRF mode). Not done.
 13. **Prompt buffers 119k -> 72k floats per token**: one pool for buffers with disjoint lifetimes within a
@@ -106,6 +111,8 @@ oneAPI 2026.0, Unsloth UD-Q2_K_XL. Run-to-run noise is about ±10% on short runs
 | Decode attention: tree reduction of the P.V partials | slower than local atomics |
 | SWA decode chunk 128 (vs 64) | slower at every depth |
 | SWA decode work-group 64 threads | slower, and broke the output (it writes one dim per thread: now a static_assert) |
+| Decode P.V: one sub-group per key group for all 3 query heads (V read once) | equal (the repeats hit the cache) |
+| Decode P.V: two 4-key steps in flight per lane | slower (registers) |
 | Decode gate-up (IQ2_S, 187 GB/s): codebook lookups replaced by arithmetic (timing only) | no change: not lookup-bound |
 | Decode gate-up work-group 64 / 128 / 512 threads (256 default) | no change |
 | Speculative decoding on the prompt path (`verify`, kept, off) | 115-150 ms per verify of 1-16 tokens (7-9 decode steps): every expert's weights are decoded; needs small-batch expert kernels |
