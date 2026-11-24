@@ -40,7 +40,7 @@ multi-fact test. How the speed was reached, step by step: [PERF.md](PERF.md).
 ## Install
 
 ```
-git clone <this repo> arcangel && cd arcangel
+git clone https://github.com/itstxl/arcangel && cd arcangel
 ./install.sh
 ```
 
