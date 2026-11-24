@@ -134,8 +134,10 @@ shifts/masks that build codebook indices are the rest. (An earlier "arithmetic o
 because the compiler folded the 4 identical rows into one: misleading.) Kept: codebook entries read as two
 32-bit words and scalar 32/16-bit weight loads instead of uint2 / byte-wise loads (interleaved results cost
 strided moves): experts 6.25 -> 5.98 ms per token (IQ1_S gate-up 0.63 -> 0.48). Tried and no better: full
-unroll, hand-pipelined loads, codebook in SLM, work-group 64-512. Next lever: fewer per-lane addresses (a row
-per lane, activations as uniform broadcast loads).
+unroll, hand-pipelined loads, codebook in SLM, work-group 64-512, and a row per lane with the activations as
+uniform loads (`k_gate_up_l`: IQ2_S 1.48 -> 2.04 ms, slower for every format). What is left is the decode
+itself: a lossless re-encoding of the codebook formats into something cheaper to expand (e.g. a 4-bit
+sign+level code, ~1.6x the bytes) would trade memory for instructions; not tried.
 
 ## Speculative decoding (2026-11-24: measured, simulated, not built)
 
