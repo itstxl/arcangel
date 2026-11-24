@@ -1,0 +1,24 @@
+# ArcAngel card profiles, read by install.sh. One line per card, tab separated.
+#
+# id      the --card name
+# chip    AOT compile target (bmg_g21 or bmg_g31)
+# vram    memory on the card, GiB
+# quant   Unsloth UD quant of Inkling 2 Mini downloaded for this card (unsloth/Inkling-2-Mini-GGUF)
+# kv      K/V cache bits (8 or 4)
+# ctx     context length in tokens
+# status  tested: run on this card; untested: chosen from the card's memory, not run on one yet
+# match   regular expression matched against `lspci` to detect the card
+# name    shown in the menu
+#
+# How the numbers were picked: weights + K/V cache + ~0.45 GiB of prompt buffers + 0.5 GiB safety margin +
+# ~1 GiB for a desktop on the same card must fit. K/V per token of context: ~9 KiB at 4 bits, ~17 KiB at 8.
+# Quants: Q4_K_XL and Q8_K_XL share the same NVFP4 experts (40 of 48 expert tensors); Q8_K_XL only widens
+# the dense layers to BF16, so it costs a lot of bandwidth for very little quality: no card defaults to it.
+# Q3_K_XL, IQ3_XXS and IQ4_XS use weight formats the engine does not support yet (Q3_K, IQ3_S, IQ4_NL, Q5_0).
+#
+#id	chip	vram	quant	kv	ctx	status	match	name
+b570	bmg_g21	10	IQ1_S	4	32768	untested	Arc B570|8086:e20c	Arc B570 (10 GB)
+b580	bmg_g21	12	Q2_K_XL	4	98304	tested	Arc B580|8086:e20b	Arc B580 (12 GB)
+b50	bmg_g21	16	Q2_K_XL	8	262144	untested	Arc Pro B50|8086:e212	Arc Pro B50 (16 GB)
+b60	bmg_g21	24	Q4_K_XL	8	262144	untested	Arc Pro B60|8086:e211	Arc Pro B60 (24 GB)
+b70	bmg_g31	32	Q4_K_XL	8	524288	untested	Arc Pro B70|Battlemage G31	Arc Pro B70 (32 GB)

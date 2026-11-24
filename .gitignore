@@ -1,0 +1,13 @@
+/build*/
+server/.venv/
+__pycache__/
+# downloaded by install.sh (tokenizer and chat template of thinkingmachines/Inkling-2-Mini)
+server/tokenizer.json
+server/chat_template.jinja
+*.gguf
+# llama.cpp answer keys for the developer tests (large; regenerate with ref-dump)
+/ref/
+bench/logs/
+bench/requests/
+src.bak*/
+/deploy/

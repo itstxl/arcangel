@@ -1,0 +1,9 @@
+ArcAngel includes or derives from the following third-party work:
+
+- src/quant_tables.h: quantisation lookup tables generated from ggml (llama.cpp, ggml/src/ggml-common.h),
+  MIT License, Copyright (c) 2023-2026 The ggml authors.
+- SPEC.md and the forward pass follow llama.cpp's Inkling 2 implementation (MIT License, The ggml authors).
+
+Not included in this repository, downloaded by install.sh:
+- Inkling 2 Mini tokenizer and chat template: thinkingmachines/Inkling-2-Mini, Apache License 2.0.
+- Model weights (GGUF quantisations): unsloth/Inkling-2-Mini-GGUF, Apache License 2.0.
