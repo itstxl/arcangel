@@ -663,7 +663,7 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
             }
         }));
         // convolution history of K and V: the chunk's last 3 raw inputs (K at channel 0, V at kvw)
-        P("b_qkv", k_bhist(q_, bproj_ + 3072, PJ, hist_[v.slot], 2 * kvw, n));
+        bhist("b_qkv", bproj_ + 3072, PJ, v.slot, 0, 2 * kvw, n);
     }
 
     // attention: flash attention over blocks of QB query tokens; the KV head's query heads share each K/V tile
@@ -968,7 +968,7 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
     // output projection, its convolution across time, residual
     run_bmm("b_wo", {bjob(L.wo, batt_, (size_t) nh * HD, bo_, D)}, n);
     P("b_conv", k_bconv_res(q_, bo_, L.post_conv.f32(), hist_[v.slot] + (size_t) 2 * kvw * 3, bxa_, bxb_, v.push >= 0, n));
-    P("b_conv", k_bhist(q_, bo_, D, hist_[v.slot] + (size_t) 2 * kvw * 3, D, n));
+    bhist("b_conv", bo_, D, v.slot, 2 * kvw, D, n);
 
     // FFN input
     {
@@ -1090,7 +1090,7 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
                                                                          L.down_s.ok() ? L.down_s.f32() : nullptr, bwts_, od, gx_dbg));
         });
         P("b_conv", k_bconv_res(q_, bo_, L.ffn_post_conv.f32(), hist_[v.slot] + (size_t) (2 * kvw + D) * 3, bxb_, bxa_, false, n));
-        P("b_conv", k_bhist(q_, bo_, D, hist_[v.slot] + (size_t) (2 * kvw + D) * 3, D, n));
+        bhist("b_conv", bo_, D, v.slot, 2 * kvw + D, D, n);
         return;
     }
 
@@ -1186,7 +1186,123 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
         });
     }
     P("b_conv", k_bconv_res(q_, bo_, L.ffn_post_conv.f32(), hist_[v.slot] + (size_t) (2 * kvw + D) * 3, bxb_, bxa_, false, n));
-    P("b_conv", k_bhist(q_, bo_, D, hist_[v.slot] + (size_t) (2 * kvw + D) * 3, D, n));
+    bhist("b_conv", bo_, D, v.slot, 2 * kvw + D, D, n);
+}
+
+void FastEngine::embed(int n) {
+    const Hparams & h = hp_;
+    // embedding rows, RMS norm with token_embd_norm
+    const W & e = m_.tok_embd;
+    const uint8_t * ep = e.p;
+    const size_t rb = e.row_bytes;
+    const uint32_t type = e.type;
+    const q::BlockShape bs = q::shape(type);
+    const int32_t * tok = btok_;
+    const float * nw = m_.tok_norm.f32();
+    float * x = bxa_;
+    const float eps = h.eps;
+    P("b_embed", q_.parallel_for(sycl::nd_range<1>((size_t) n * WG, WG), [=](sycl::nd_item<1> it) {
+        const int t = (int) it.get_local_id(0), tk = (int) it.get_group(0);
+        const uint8_t * row = ep + (size_t) tok[tk] * rb;
+        float v[32];
+        float ss = 0.0f;
+        const bool mine = t < D / 32;
+        if (mine) {
+            const int c0 = t * 32;
+            q::decode32(type, row + (size_t) (c0 / bs.elems) * bs.bytes, (c0 % bs.elems) / 32, v);
+            for (int j = 0; j < 32; ++j) ss += v[j] * v[j];
+        }
+        ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+        const float r = 1.0f / sycl::sqrt(ss / D + eps);
+        if (mine)
+            for (int j = 0; j < 32; ++j) x[(size_t) tk * D + t * 32 + j] = v[j] * r * nw[t * 32 + j];
+    }));
+}
+
+void FastEngine::bhist(const char * label, const float * raw, size_t rs, int slot, int off, int channels, int n) {
+    if (!verify_) {
+        P(label, k_bhist(q_, raw, rs, hist_[slot] + (size_t) off * 3, channels, n));
+        return;
+    }
+    const int HC = hp_.conv_channels();
+    float * dst = vraw_ + (size_t) slot * VMAX * HC + off;
+    P(label, q_.parallel_for(sycl::range<2>((size_t) n, (size_t) channels), [=](sycl::item<2> it) {
+        const size_t t = it[0], c = it[1];
+        dst[t * HC + c] = raw[t * rs + c];
+    }));
+}
+
+const std::vector<float> & FastEngine::verify(const std::vector<int> & tokens, int pos0) {
+    const Hparams & h = hp_;
+    const int n = (int) tokens.size();
+    if (n < 1 || n > VMAX || n > TB_) throw std::runtime_error("verify: 1 to 16 tokens");
+    if (pos0 + n > n_ctx_) throw std::runtime_error("verify: context is full");
+    if (!vraw_) {
+        vraw_ = dev<float>((size_t) h.n_slot() * VMAX * h.conv_channels());
+        vlogits_ = dev<float>((size_t) VMAX * h.n_vocab);
+        vhist_ = sycl::malloc_device<float *>((size_t) h.n_slot(), q_);
+        allocs_.push_back(vhist_);
+        std::vector<float *> hp(hist_.begin(), hist_.end());
+        q_.memcpy(vhist_, hp.data(), hp.size() * sizeof(float *)).wait();
+    }
+    verify_ = true;
+    vn_ = n;
+    try {
+        q_.memcpy(btok_, tokens.data(), n * sizeof(int32_t));
+        embed(n);
+        const auto & vs = m_.schedule.visits;
+        for (size_t i = 0; i < vs.size(); ++i) {
+            bvisit(vs[i], n, pos0);
+            if ((int) i + 1 == m_.schedule.prelude_end) P("b_prelude", q_.memcpy(bprelude_, bxa_, (size_t) n * D * sizeof(float)));
+        }
+        // logits after every token: output mix, norm, LM head, row by row (as prefill does for its last token)
+        const size_t TD = (size_t) TB_ * D;
+        for (int r = 0; r < n; ++r) {
+            const size_t off = (size_t) r * D;
+            BMix a;
+            for (size_t s = 0; s < m_.schedule.out_blocks.size(); ++s) a.st[s] = bstore_ + (size_t) m_.schedule.out_blocks[s] * TD + off;
+            a.ns = (int) m_.schedule.out_blocks.size();
+            a.cur = bxa_ + off;
+            a.qw = m_.output_res_query.f32();
+            a.nq = 1;
+            a.eps = h.eps;
+            a.out[0] = bf_ + off;
+            a.normw[0] = m_.output_norm.f32();
+            P("b_out", k_bmix(q_, a, 1));
+        }
+        for (int r = 0; r < n; ++r) run_bmm("b_head", {bjob(m_.output, bf_ + (size_t) r * D, D, vlogits_ + (size_t) r * h.n_vocab, 0)}, 1);
+    } catch (...) {
+        verify_ = false;
+        throw;
+    }
+    verify_ = false;
+    vlogits_host_.resize((size_t) n * h.n_vocab);
+    q_.memcpy(vlogits_host_.data(), vlogits_, vlogits_host_.size() * sizeof(float)).wait();
+    if (h.softcap > 0.0f)
+        for (float & v : vlogits_host_) v = h.softcap * std::tanh(v / h.softcap);
+    return vlogits_host_;
+}
+
+void FastEngine::commit(int keep) {
+    const Hparams & h = hp_;
+    if (keep < 0 || keep > vn_) throw std::runtime_error("commit: keep out of range");
+    if (keep == 0) return;
+    // every slot's history becomes the last 3 inputs of (old history ++ the kept tokens' inputs)
+    const int HC = h.conv_channels(), ns = h.n_slot();
+    float ** hdev = vhist_;
+    const float * vr = vraw_;
+    q_.parallel_for(sycl::range<2>((size_t) ns, (size_t) HC), [=](sycl::item<2> it) {
+        const int s = (int) it[0], c = (int) it[1];
+        float * hist = hdev[s] + (size_t) c * 3;
+        const float * raw = vr + (size_t) s * VMAX * HC + c;
+        float nv[3];
+        for (int j = 0; j < 3; ++j) {
+            const int t = keep - 3 + j;
+            nv[j] = t >= 0 ? raw[(size_t) t * HC] : hist[3 + t];
+        }
+        for (int j = 0; j < 3; ++j) hist[j] = nv[j];
+    }).wait();
+    vn_ = 0;
 }
 
 const std::vector<float> & FastEngine::prefill(const std::vector<int> & tokens, int pos0) {
@@ -1197,33 +1313,7 @@ const std::vector<float> & FastEngine::prefill(const std::vector<int> & tokens, 
         const int n = (int) std::min<size_t>(TB_, tokens.size() - c0);
         const int p0 = pos0 + (int) c0;
         q_.memcpy(btok_, tokens.data() + c0, n * sizeof(int32_t));
-        {  // embedding rows, RMS norm with token_embd_norm
-            const W & e = m_.tok_embd;
-            const uint8_t * ep = e.p;
-            const size_t rb = e.row_bytes;
-            const uint32_t type = e.type;
-            const q::BlockShape bs = q::shape(type);
-            const int32_t * tok = btok_;
-            const float * nw = m_.tok_norm.f32();
-            float * x = bxa_;
-            const float eps = h.eps;
-            P("b_embed", q_.parallel_for(sycl::nd_range<1>((size_t) n * WG, WG), [=](sycl::nd_item<1> it) {
-                const int t = (int) it.get_local_id(0), tk = (int) it.get_group(0);
-                const uint8_t * row = ep + (size_t) tok[tk] * rb;
-                float v[32];
-                float ss = 0.0f;
-                const bool mine = t < D / 32;
-                if (mine) {
-                    const int c0 = t * 32;
-                    q::decode32(type, row + (size_t) (c0 / bs.elems) * bs.bytes, (c0 % bs.elems) / 32, v);
-                    for (int j = 0; j < 32; ++j) ss += v[j] * v[j];
-                }
-                ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
-                const float r = 1.0f / sycl::sqrt(ss / D + eps);
-                if (mine)
-                    for (int j = 0; j < 32; ++j) x[(size_t) tk * D + t * 32 + j] = v[j] * r * nw[t * 32 + j];
-            }));
-        }
+        embed(n);
         const auto & vs = m_.schedule.visits;
         for (size_t i = 0; i < vs.size(); ++i) {
             bvisit(vs[i], n, p0);

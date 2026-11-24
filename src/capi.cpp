@@ -69,6 +69,24 @@ void ink_close(void * hp) { delete (Handle *) hp; }
 int ink_n_vocab(void * hp) { return ((Handle *) hp)->eng->hp().n_vocab; }
 int ink_chunk(void * hp) { return ((Handle *) hp)->eng->prefill_chunk(); }
 
+// Speculative decoding: run n tokens (<= 16) from pos0, logits after each of them into logits[n][vocab]; then
+// ink_commit(keep) to keep the first `keep` (decoding continues at pos0 + keep).
+int ink_verify(void * hp, const int32_t * toks, int n, int pos0, float * logits) {
+    return guarded([&] {
+        auto * h = (Handle *) hp;
+        const auto & l = h->eng->verify(std::vector<int>(toks, toks + n), pos0);
+        if (logits) std::memcpy(logits, l.data(), l.size() * sizeof(float));
+        return 0;
+    });
+}
+
+int ink_commit(void * hp, int keep) {
+    return guarded([&] {
+        ((Handle *) hp)->eng->commit(keep);
+        return 0;
+    });
+}
+
 int ink_prefill(void * hp, const int32_t * toks, int n, int pos0, float * logits) {
     return guarded([&] {
         auto * h = (Handle *) hp;

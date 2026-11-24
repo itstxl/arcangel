@@ -68,6 +68,9 @@ if(INK_LLAMA_TESTS)
   set_target_properties(gguf-retype PROPERTIES BUILD_RPATH ${INK_LLAMA_LIBDIR})
 endif()
 
+add_executable(test-verify tests/test_verify.cpp)
+target_link_libraries(test-verify PRIVATE inkcore)
+
 add_executable(bench-decode tools/bench_decode.cpp)
 target_link_libraries(bench-decode PRIVATE inkcore)
 

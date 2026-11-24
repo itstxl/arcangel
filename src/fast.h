@@ -43,6 +43,14 @@ public:
     // Returns the logits after the last token; decoding continues with step(next, pos0 + tokens.size()).
     const std::vector<float> & prefill(const std::vector<int> & tokens, int pos0);
     int prefill_chunk() const { return TB_; }
+
+    // Speculative decoding: run tokens[0..n) (n <= VMAX) at positions pos0.. in one batch and return the logits
+    // after every one of them ([n][vocab]). The K/V cache is written for all n; the convolution history is not
+    // advanced until commit(keep), which keeps the first `keep` tokens (decoding then continues at pos0 + keep;
+    // the cache entries past it are overwritten later).
+    static constexpr int VMAX = 16;
+    const std::vector<float> & verify(const std::vector<int> & tokens, int pos0);
+    void commit(int keep);
     bool use_xmx = true;
     bool gate_up_r = true;  // multi-row codebook gate-up (A/B switch, env INK_GUR=0)
     bool down_q8 = true;  // expert down with int8 activations (DP4A) for NVFP4 / Q2_0 (A/B switch, env INK_DOWNQ8=0)  // prompt matrix multiplies on the XMX units (A/B switch)
@@ -147,6 +155,15 @@ private:
     float * blogits_ = nullptr, * bwts_ = nullptr;
     sycl::half * bact_ = nullptr;  // expert activations [pair][n_ff], f16 (the down GEMM reads f16 anyway)
     void P(const char * label, sycl::event e);
+    // convolution-history update after a prompt chunk (verify mode: saves the chunk's inputs for commit instead)
+    void bhist(const char * label, const float * raw, size_t rs, int slot, int off, int channels, int n);
+    bool verify_ = false;
+    int vn_ = 0;
+    float * vraw_ = nullptr;     // [slot][VMAX][conv channels]: verify chunk inputs per slot
+    float * vlogits_ = nullptr;  // [VMAX][vocab]
+    float ** vhist_ = nullptr;   // device copy of hist_ (the per-slot pointers), for commit
+    void embed(int n);           // embedding rows of btok_[0..n) into bxa_
+    std::vector<float> vlogits_host_;
     std::vector<std::pair<const char *, sycl::event>> prof_events_;
     std::vector<std::pair<std::string, double>> prof_ms_;  // label -> total ms
     int prof_tokens_ = 0;
