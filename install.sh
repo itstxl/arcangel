@@ -261,7 +261,8 @@ if [ -f "$build/CMakeCache.txt" ] && ! grep -q "^INK_AOT_TARGETS:STRING=$chip\$"
 fi
 cmake -S "$REPO" -B "$build" "${gen[@]}" -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=Release \
   -DINK_AOT_TARGETS="$chip" >/dev/null
-cmake --build "$build" --target inkling ink-probe bench-decode bench-prefill test-forward -j"$(nproc)" | grep -Ev '^\[|^ninja: ' || true
+cmake --build "$build" --target inkling ink-probe bench-decode bench-prefill test-forward -j"$(nproc)" |
+  grep -Ev '^\[|^ninja: |^Build succeeded|^Compilation from IR|^$' || true
 [ -f "$build/libinkling.so" ] || die "build failed (run: cmake --build $build)"
 ok "$build/libinkling.so"
 
@@ -286,8 +287,9 @@ if m:
     total, free = float(m.group(1)), float(m.group(2))
     print(f"  the card has {total:.1f} GiB, {free:.1f} GiB free right now")
     if need > free:
-        print("  \033[33mwarning:\033[0m more than is free right now: close other GPU programs (another model server,"
-              " games), or re-run with a smaller --ctx or --kv-bits 4")
+        print("  warning: that is more than is free right now. Fine if ArcAngel or another model server is running"
+              " (it frees its memory when stopped); otherwise close other GPU programs, or re-run with a smaller"
+              " --ctx or --kv-bits 4")
 PY
 
 # ------------------------------------------------------------------------------------------------------
@@ -347,7 +349,7 @@ except FileNotFoundError:
     cfg = {"$schema": "https://opencode.ai/config.json"}
 cfg.setdefault("provider", {})["arcangel"] = {
     "npm": "@ai-sdk/openai-compatible",
-    "name": f"ArcAngel ({card})",
+    "name": "ArcAngel",
     "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
     "models": {"inkling-2-mini": {
         "name": f"Inkling 2 Mini (ArcAngel, {ctx // 1024}k)",
@@ -395,7 +397,11 @@ fi
 
 echo
 echo "${B}Done.${N} ArcAngel: $cname, $gguf_name, $((ctx / 1024))k context."
-echo "  start/stop:  systemctl --user start arcangel / systemctl --user stop arcangel"
-echo "  logs:        journalctl --user -u arcangel -f"
+if [ $service = 1 ]; then
+  echo "  start/stop:  systemctl --user start arcangel / systemctl --user stop arcangel"
+  echo "  logs:        journalctl --user -u arcangel -f"
+else
+  echo "  start:       $REPO/server/run.sh"
+fi
 echo "  API:         http://127.0.0.1:$port/v1 (model name: inkling-2-mini)"
 echo "  settings:    $CONF_DIR/arcangel.env"
