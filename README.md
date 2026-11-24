@@ -137,9 +137,19 @@ another.
   with `ocloc`
 - CMake 3.24+, Python 3.10+, about 10-20 GB of disk for the model
 
-On Arch-based systems (including CachyOS and Omarchy), the installer can install these:
-`intel-oneapi-dpcpp-cpp intel-compute-runtime level-zero-loader cmake ninja python curl`. On other
-distributions, install them yourself first (see `install.sh` for package names); only Arch has been tested.
+The installer installs these itself (with sudo, after asking):
+
+| Distribution | Status |
+|---|---|
+| Arch, CachyOS, Omarchy, EndeavourOS | tested end to end on a B580 |
+| Ubuntu 24.04, 25.10 | packages and build tested (in a container, no GPU); adds Intel's oneAPI apt repository, and on 24.04 Intel's graphics PPA |
+| Fedora 43 | packages and build tested (in a container, no GPU); adds Intel's oneAPI repository |
+| Debian 13 | no Intel GPU compute runtime in Debian: install it from [intel/compute-runtime releases](https://github.com/intel/compute-runtime/releases) first |
+| others | install the list above yourself, then run the installer |
+
+Before downloading the model it checks the oneAPI version (2025.1+), the kernel (6.12+ for Battlemage), that
+the GPU has the `xe` or `i915` driver and that Level Zero can see it, so a missing driver shows up in seconds,
+not after a 10 GB download. `./install.sh --build-only` installs the tools and builds the engine without a GPU.
 
 ## How it works
 
