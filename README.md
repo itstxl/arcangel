@@ -9,8 +9,33 @@ coding agents can use it.
   spill.
 - **Long context.** 96k tokens on a 12 GB B580, up to 512k on a 32 GB B70.
 - **Fast.** On a B580: 65 tok/s generation at short context, 43 tok/s at 90k, prompts read at 600-900 tok/s.
-  That is about twice llama.cpp's generation speed and three to four times its prompt speed on the same card
-  (details in [PERF.md](PERF.md)).
+  That is about twice llama.cpp's generation speed and three to four times its prompt speed on the same card.
+
+## Tested speeds
+
+Arc B580 (12 GB), UD-Q2_K_XL, 96k context, 4-bit K/V cache, 1024-token prompt chunks. For comparison,
+llama.cpp (Vulkan) was run on the same card with the same model, including its DSpark draft model for
+speculative decoding.
+
+| Generation (tokens/s) | ArcAngel | llama.cpp |
+|---|---|---|
+| short context | **65** | 33-38 |
+| at 4k tokens | **62** | |
+| at 12k (a real opencode session) | **57** | 17-21 |
+| at 30k | **54** | ~18 |
+| at 90k | **43** | (does not fit) |
+
+| Prompt reading (tokens/s) | ArcAngel | llama.cpp |
+|---|---|---|
+| 4k-token prompt | **900** | ~225 |
+| 16k | **755** | |
+| 32k | **783** | |
+| 90k | **627** (144 s) | (does not fit) |
+
+Accuracy: against llama.cpp's CPU output the engine matches the top token on every step tested, with KL
+divergence 0.001-0.002 using an 8-bit cache and 0.006-0.016 using the 4-bit cache. With the 4-bit cache, it
+found hidden facts placed at 10%, 55% and 95% of a 90k-token prompt, and 4 of 4 facts in a 60k
+multi-fact test. How the speed was reached, step by step: [PERF.md](PERF.md).
 
 ## Install
 
