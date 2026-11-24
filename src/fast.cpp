@@ -30,57 +30,94 @@ inline int32_t signed4(uint32_t g, uint32_t m) { return (int32_t) ((g ^ m) + (m 
 
 // One 32-value block (ib) of a codebook row . int8 x. Rows split into these units balance over the 16 lanes far
 // better than whole 64/128-value steps (an IQ1_S row of 2304 has 18 steps: 2 lanes would do double work).
-template <uint32_t T>
-inline float unit_q8x(const RowRef rr, int ib, const sycl::int4 x0, const sycl::int4 x1, float xdb, float xsb, const q::Tabs & tb) {
-    using sycl::ext::oneapi::dot_acc;
-    const uint8_t * arow = rr.a;
+// Split into the loads (unit_load) and the arithmetic (unit_dot), so kernels can keep the next units' loads in
+// flight while computing the current one.
+struct UnitRaw {
+    uint32_t w0 = 0, w1 = 0, aux = 0;  // value bytes; per-unit scale bytes
+    uint16_t d = 0;                    // f16 bits of the block scale
+};
+template <uint32_t T> inline UnitRaw unit_load(const RowRef rr, int ib) {
+    UnitRaw u;
     if constexpr (T == q::IQ1_SR) {
-        const uint32_t w = *(const uint32_t *) (rr.p + 4 * ib);
-        const uint32_t qh = q::rd16(arow + 2 * ib);
-        const float dl = q::f16(rr.a2 + (ib / 8) * 2) * (float) (2 * ((qh >> 12) & 7) + 1);
+        u.w0 = *(const uint32_t *) (rr.p + 4 * ib);
+        u.aux = *(const uint16_t *) (rr.a + 2 * ib);
+        u.d = *(const uint16_t *) (rr.a2 + (ib / 8) * 2);
+    } else {
+        // scalar 32-/16-bit loads: a uint2 (or byte-wise 16-bit) load comes back interleaved across the SIMD16
+        // lanes and costs strided moves to unpack (profiled: moves were 31% of the kernel's instructions)
+        u.w0 = *(const uint32_t *) (rr.p + 8 * ib);
+        u.w1 = *(const uint32_t *) (rr.p + 8 * ib + 4);
+        if constexpr (T == q::IQ2_SR) {
+            u.aux = *(const uint16_t *) (rr.a + 2 * ib);  // qh, scale
+            u.d = *(const uint16_t *) (rr.a2 + (ib / 8) * 2);
+        } else if constexpr (T == q::IQ2_XXSR) {
+            u.d = *(const uint16_t *) (rr.a + (ib / 8) * 2);
+        } else {  // IQ2_XSR
+            u.aux = rr.a[ib];
+            u.d = *(const uint16_t *) (rr.a2 + (ib / 8) * 2);
+        }
+    }
+    return u;
+}
+inline float h2f_bits(uint16_t b) { return (float) sycl::bit_cast<sycl::half>(b); }
+
+template <uint32_t T>
+inline float unit_dot(const UnitRaw & u, const sycl::int4 x0, const sycl::int4 x1, float xdb, float xsb, const q::Tabs & tb) {
+    using sycl::ext::oneapi::dot_acc;
+    if constexpr (T == q::IQ1_SR) {
+        const uint32_t w = u.w0, qh = u.aux;
+        const float dl = h2f_bits(u.d) * (float) (2 * ((qh >> 12) & 7) + 1);
         const float delta = qh & 0x8000 ? -0.125f : 0.125f;
         int32_t isum = 0;
         for (int l = 0; l < 4; ++l) {
-            const uint64_t grid = tb.iq1s[((w >> (8 * l)) & 0xFF) | (((qh >> (3 * l)) & 7) << 8)];
+            // the 64-bit codebook entry read as two 32-bit words: SIMD16 64-bit values cost strided moves to split
+            const uint32_t * g32 = (const uint32_t *) tb.iq1s + 2 * (((w >> (8 * l)) & 0xFF) | (((qh >> (3 * l)) & 7) << 8));
+            const uint32_t glo = g32[0], ghi = g32[1];
             const int32_t xa = l < 2 ? x0[2 * l] : x1[2 * l - 4], xb = l < 2 ? x0[2 * l + 1] : x1[2 * l - 3];
-            isum = dot_acc((int32_t) (uint32_t) grid, xa, isum);
-            isum = dot_acc((int32_t) (uint32_t) (grid >> 32), xb, isum);
+            isum = dot_acc((int32_t) glo, xa, isum);
+            isum = dot_acc((int32_t) ghi, xb, isum);
         }
         return dl * (xdb * (float) isum + delta * xsb);
     } else {
-        const sycl::uint2 wv = *(const sycl::uint2 *) (rr.p + 8 * ib);
+        const uint32_t wv[2] = {u.w0, u.w1};
         int32_t part[2] = {0, 0};  // the two 16-value halves (IQ2_S / IQ2_XS scale them separately)
         for (int l = 0; l < 4; ++l) {
-            uint64_t grid;
+            const uint32_t * g32;  // the 64-bit codebook entry as two 32-bit words (see IQ1_S above)
             uint32_t signs;
             if constexpr (T == q::IQ2_SR) {
-                const uint32_t qh = arow[2 * ib];
-                grid = tb.iq2s[((wv[0] >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300)];
+                const uint32_t qh = u.aux & 0xFF;
+                g32 = (const uint32_t *) tb.iq2s + 2 * (((wv[0] >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300));
                 signs = (wv[1] >> (8 * l)) & 0xFF;
             } else if constexpr (T == q::IQ2_XXSR) {
-                grid = tb.iq2xxs[(wv[0] >> (8 * l)) & 0xFF];
+                g32 = (const uint32_t *) tb.iq2xxs + 2 * ((wv[0] >> (8 * l)) & 0xFF);
                 signs = tb.ksigns[(wv[1] >> (7 * l)) & 127];
             } else {  // IQ2_XSR
                 const uint32_t v = (wv[l / 2] >> (16 * (l % 2))) & 0xFFFF;
-                grid = tb.iq2xs[v & 511];
+                g32 = (const uint32_t *) tb.iq2xs + 2 * (v & 511);
                 signs = tb.ksigns[v >> 9];
             }
+            const uint32_t glo = g32[0], ghi = g32[1];
             const int32_t xa = l < 2 ? x0[2 * l] : x1[2 * l - 4], xb = l < 2 ? x0[2 * l + 1] : x1[2 * l - 3];
-            int32_t t = dot_acc(signed4((uint32_t) grid, byte_mask4(signs & 0xF)), xa, 0);
-            t = dot_acc(signed4((uint32_t) (grid >> 32), byte_mask4(signs >> 4)), xb, t);
+            int32_t t = dot_acc(signed4(glo, byte_mask4(signs & 0xF)), xa, 0);
+            t = dot_acc(signed4(ghi, byte_mask4(signs >> 4)), xb, t);
             part[l / 2] += t;
         }
         float db0, db1;
         if constexpr (T == q::IQ2_XXSR) {
-            db0 = db1 = q::f16(arow + (ib / 8) * 2) * (0.5f + (float) (wv[1] >> 28)) * 0.25f;
+            db0 = db1 = h2f_bits(u.d) * (0.5f + (float) (wv[1] >> 28)) * 0.25f;
         } else {
-            const uint32_t sc = T == q::IQ2_SR ? arow[2 * ib + 1] : arow[ib];
-            const float d = q::f16(rr.a2 + (ib / 8) * 2);
+            const uint32_t sc = T == q::IQ2_SR ? (u.aux >> 8) & 0xFF : u.aux;
+            const float d = h2f_bits(u.d);
             db0 = d * (0.5f + (float) (sc & 0xf)) * 0.25f;
             db1 = d * (0.5f + (float) (sc >> 4)) * 0.25f;
         }
         return xdb * (db0 * (float) part[0] + db1 * (float) part[1]);
     }
+}
+
+template <uint32_t T>
+inline float unit_q8x(const RowRef rr, int ib, const sycl::int4 x0, const sycl::int4 x1, float xdb, float xsb, const q::Tabs & tb) {
+    return unit_dot<T>(unit_load<T>(rr, ib), x0, x1, xdb, xsb, tb);
 }
 
 template <uint32_t T>
@@ -405,11 +442,15 @@ template <uint32_t T, bool STAGE> sycl::event k_gate_up(sycl::queue & q, const G
 #ifndef INK_GUR
 #define INK_GUR 4
 #endif
-template <uint32_t T> sycl::event k_gate_up_r(sycl::queue & q, const GateUpArgs a) {
+template <uint32_t T, bool STAGE = false> sycl::event k_gate_up_r(sycl::queue & q, const GateUpArgs a) {
     constexpr int GR = INK_GUR;
     const size_t nsg = (size_t) a.nu * a.nff / GR;
-    return q.parallel_for(sycl::nd_range<1>((nsg + RPG - 1) / RPG * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
-        const q::Tabs tb;
+    return q.submit([&](sycl::handler & cgh) {
+    sycl::local_accessor<uint64_t, 1> gl(STAGE ? grid64<T>() : 1, cgh);
+    sycl::local_accessor<uint8_t, 1> ksl(STAGE ? 128 : 1, cgh);
+    cgh.parallel_for(sycl::nd_range<1>((nsg + RPG - 1) / RPG * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        q::Tabs tb;
+        if constexpr (STAGE) tb = stage<T>(it, &gl[0], &ksl[0]);  // codebook in local memory: not evicted by the weights
         const auto sg = it.get_sub_group();
         const size_t gid = it.get_group(0) * RPG + sg.get_group_id()[0];
         if (gid >= nsg) return;
@@ -427,6 +468,7 @@ template <uint32_t T> sycl::event k_gate_up_r(sycl::queue & q, const GateUpArgs 
             const float xdb = a.xd[ib], xsb = a.xs[ib];
             for (int r = 0; r < GR; ++r) acc[r] += unit_q8x<T>(rows[r], ib, x0, x1, xdb, xsb, tb);
         }
+
         // sum over the 8 lanes of each half
         for (int r = 0; r < GR; ++r)
             for (int off = 4; off > 0; off /= 2) acc[r] += sycl::permute_group_by_xor(sg, acc[r], off);
@@ -438,6 +480,7 @@ template <uint32_t T> sycl::event k_gate_up_r(sycl::queue & q, const GateUpArgs 
                 a.act[(size_t) k * a.nff + i0 + r] = g * (a.lb > 0.0f ? a.lb * sycl::tanh(uu / a.lb) : uu);
             }
         }
+    });
     });
 }
 
@@ -1673,7 +1716,7 @@ void FastEngine::visit(const Visit & v) {
             const char * lab = profile ? tlabel("gate_up", T) : "gate_up";
             if constexpr (has_q8<T>()) {
                 if (gate_up_r && a.nff % INK_GUR == 0) {
-                    P(lab, k_gate_up_r<T>(q_, a));
+                    P(lab, stage_tabs ? k_gate_up_r<T, true>(q_, a) : k_gate_up_r<T, false>(q_, a));
                     return;
                 }
             }

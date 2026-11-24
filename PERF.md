@@ -118,6 +118,25 @@ oneAPI 2026.0, Unsloth UD-Q2_K_XL. Run-to-run noise is about ±10% on short runs
 | Speculative decoding on the prompt path (`verify`, kept, off) | 115-150 ms per verify of 1-16 tokens (7-9 decode steps): every expert's weights are decoded; needs small-batch expert kernels |
 | llama.cpp SYCL backend, Strata 0.2.19/0.2.20, arcint | slower than llama.cpp Vulkan or cannot run the formats |
 
+## Decode expert kernels: compute-bound, not memory-bound (2026-11-24, unitrace EU stall sampling)
+
+`unitrace --stall-sampling` (intel/pti-gpu, built from source; needs `sysctl dev.xe.observation_paranoid=0`):
+
+| Kernel | Active | Send / scoreboard stalls |
+|---|---|---|
+| gate-up IQ2_S (`k_gate_up_r`) | 65% (+12% pipe) | 17% |
+| down NVFP4 (`k_down_q8`) | 78% | 9% |
+| dense Q8_0 matrix-vector (`k_mv`) | 32% | 61% |
+
+So the experts are limited by instruction throughput, the dense layers by memory. In the gate-up kernel the
+dot products (dp4a) are ~3% of the instructions: moves (27-31%), 64-bit per-lane address arithmetic, and the
+shifts/masks that build codebook indices are the rest. (An earlier "arithmetic only" experiment read 0.43 ms
+because the compiler folded the 4 identical rows into one: misleading.) Kept: codebook entries read as two
+32-bit words and scalar 32/16-bit weight loads instead of uint2 / byte-wise loads (interleaved results cost
+strided moves): experts 6.25 -> 5.98 ms per token (IQ1_S gate-up 0.63 -> 0.48). Tried and no better: full
+unroll, hand-pipelined loads, codebook in SLM, work-group 64-512. Next lever: fewer per-lane addresses (a row
+per lane, activations as uniform broadcast loads).
+
 ## Speculative decoding (2026-11-24: measured, simulated, not built)
 
 Copy drafting (prompt lookup) on 37 traced opencode requests (16k generated tokens, `ARCANGEL_TRACE` +
