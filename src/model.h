@@ -85,7 +85,9 @@ public:
     std::vector<LayerW> layers;
     std::vector<LoopW> loops;
     Schedule schedule;
-    uint64_t weight_bytes = 0;
+    uint64_t weight_bytes = 0;  // on the GPU
+    uint64_t host_bytes = 0;    // offloaded expert weights in pinned system RAM (INK_OFFLOAD)
+    std::vector<bool> offloaded;  // per physical layer: routed experts in system RAM
 
     // Throws when `extra` bytes beyond the weights would not fit in the card's free memory with a margin.
     static void check_fits(sycl::queue & q, uint64_t need, const std::string & what);

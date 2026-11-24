@@ -3,6 +3,8 @@
 #include "device.h"
 #include "quant.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -10,18 +12,29 @@ namespace ink {
 
 namespace {
 
-W load(sycl::queue & q, const GgufFile & f, const std::string & name, bool required, uint64_t & total,
-       std::vector<void *> & allocs, bool repack) {
+// host = true: the tensor lives in pinned host memory (USM host allocation) that the GPU reads over PCIe and
+// the CPU can read directly: expert offloading. `total` counts device bytes only, `host_total` the rest.
+W load_impl(sycl::queue & q, const GgufFile & f, const std::string & name, bool required, uint64_t & total,
+       std::vector<void *> & allocs, bool repack, bool host, uint64_t * host_total) {
     W w;
     const GgufTensor * t = f.tensor(name);
     if (!t) {
         if (required) throw std::runtime_error("model is missing tensor " + name);
         return w;
     }
-    auto * dev = sycl::malloc_device<uint8_t>(t->n_bytes, q);
+    auto alloc = [&](size_t n) { return host ? sycl::malloc_host<uint8_t>(n, q) : sycl::malloc_device<uint8_t>(n, q); };
+    uint64_t dummy = 0;
+    uint64_t & tot = host ? (host_total ? *host_total : dummy) : total;
+    // a pinned host destination is filled by the CPU: q.memcpy between two host buffers goes through the
+    // driver's staging copies (measured: minutes for UD-Q4_K_XL's 8 GiB of offloaded experts)
+    auto upload = [&](void * dst, const void * src, size_t n) {
+        if (host) std::memcpy(dst, src, n);
+        else q.memcpy(dst, src, n).wait();
+    };
+    auto * dev = alloc(t->n_bytes);
     if (!dev) throw std::runtime_error("device allocation failed for " + name);
     allocs.push_back(dev);
-    total += t->n_bytes;
+    tot += t->n_bytes;
     const q::BlockShape bs = q::shape(t->type);
     w.type = w.ktype = t->type;
     for (int i = 0; i < 4; ++i) w.ne[i] = t->ne[i];
@@ -42,7 +55,7 @@ W load(sycl::queue & q, const GgufFile & f, const std::string & name, bool requi
                 std::memcpy(vals + (size_t) r * cols + b * 32, src + b * 34 + 2, 32);
             }
         }
-        q.memcpy(dev, host.data(), t->n_bytes).wait();
+        upload(dev, host.data(), t->n_bytes);
         w.ktype = q::Q8_0R;
         w.row_bytes = (size_t) cols;
         w.aux = dev + (size_t) rows * cols;
@@ -52,16 +65,16 @@ W load(sycl::queue & q, const GgufFile & f, const std::string & name, bool requi
     // Repacked layouts: allocate the planes, fill them on the host, upload, point the weight at them.
     auto planes = [&](uint32_t ktype, size_t vrow, size_t arow, size_t a2row, auto && fill) {
         const size_t vb = (size_t) rows * vrow, ab = (size_t) rows * arow, a2b = (size_t) rows * a2row;
-        auto * d2 = sycl::malloc_device<uint8_t>(vb + ab + a2b, q);
+        auto * d2 = alloc(vb + ab + a2b);
         if (!d2) throw std::runtime_error("device allocation failed for " + name);
         allocs.back() = d2;
         sycl::free(dev, q);
-        total += vb + ab + a2b - t->n_bytes;
+        tot += vb + ab + a2b - t->n_bytes;
         std::vector<uint8_t> host(vb + ab + a2b);
         for (int64_t r = 0; r < rows; ++r)
             fill(t->data + (size_t) r * w.row_bytes, host.data() + (size_t) r * vrow, host.data() + vb + (size_t) r * arow,
                  host.data() + vb + ab + (size_t) r * a2row);
-        q.memcpy(d2, host.data(), host.size()).wait();
+        upload(d2, host.data(), host.size());
         w.ktype = ktype;
         w.p = d2;
         w.row_bytes = vrow;
@@ -149,11 +162,11 @@ W load(sycl::queue & q, const GgufFile & f, const std::string & name, bool requi
         // Lossless: value = d * scale * q exactly as the file decodes. 8 + 0.5 + 0.06 bits per value.
         const int64_t nb = cols / 256;
         const size_t vbytes = (size_t) rows * cols, sbytes = (size_t) rows * cols / 16, dbytes = (size_t) rows * nb * 2;
-        auto * dev2 = sycl::malloc_device<uint8_t>(vbytes + sbytes + dbytes, q);
+        auto * dev2 = alloc(vbytes + sbytes + dbytes);
         if (!dev2) throw std::runtime_error("device allocation failed for " + name);
         allocs.back() = dev2;
         sycl::free(dev, q);
-        total += vbytes + sbytes + dbytes - t->n_bytes;
+        tot += vbytes + sbytes + dbytes - t->n_bytes;
         std::vector<uint8_t> host(vbytes + sbytes + dbytes);
         int8_t * vals = (int8_t *) host.data();
         int8_t * scl = (int8_t *) (host.data() + vbytes);
@@ -179,7 +192,7 @@ W load(sycl::queue & q, const GgufFile & f, const std::string & name, bool requi
                 for (int j = 0; j < 16; ++j) scl[(size_t) r * (cols / 16) + b * 16 + j] = sc0[j];
             }
         }
-        q.memcpy(dev2, host.data(), host.size()).wait();
+        upload(dev2, host.data(), host.size());
         w.ktype = q::Q6_KR;
         w.p = dev2;
         w.row_bytes = (size_t) cols;
@@ -189,7 +202,18 @@ W load(sycl::queue & q, const GgufFile & f, const std::string & name, bool requi
         w.aux2_row_bytes = (size_t) nb * 2;
         return w;
     }
-    q.memcpy(dev, t->data, t->n_bytes);
+    if (host) std::memcpy(dev, t->data, t->n_bytes);
+    else q.memcpy(dev, t->data, t->n_bytes);
+    return w;
+}
+
+W load(sycl::queue & q, const GgufFile & f, const std::string & name, bool required, uint64_t & total,
+       std::vector<void *> & allocs, bool repack, bool host = false, uint64_t * host_total = nullptr) {
+    W w = load_impl(q, f, name, required, total, allocs, repack, host, host_total);
+    if (const GgufTensor * t = f.tensor(name)) {
+        q.wait();  // device uploads read the mapping asynchronously
+        f.release(t->data, t->n_bytes);
+    }
     return w;
 }
 
@@ -284,12 +308,56 @@ Model::Model(sycl::queue & q, const GgufFile & f, bool repack) : q_(q) {
     if (hp.n_conv != 4) throw std::runtime_error("engine assumes 4 convolution taps");
     if (hp.head_dim != 128) throw std::runtime_error("engine assumes head dim 128");
 
-    uint64_t weights = 0;
-    for (const auto & t : f.tensors()) weights += t.n_bytes;
+    // Expert offloading (INK_OFFLOAD): the routed experts of chosen layers stay in pinned system RAM. "once" =
+    // the layers outside the loop core, which run once per token (the core's run n_pass times): half the expert
+    // bytes for a quarter of the per-token expert reads. Or a list of layers, e.g. "0-5,18-23".
+    std::vector<bool> off(hp.n_layer, false);
+    if (const char * e = getenv("INK_OFFLOAD")) {
+        const std::string spec = e;
+        if (spec == "once") {
+            for (int i = 0; i < hp.n_layer; ++i) off[i] = i < hp.loop_start || i >= hp.loop_end;
+        } else if (!spec.empty() && spec != "none") {
+            size_t i = 0;
+            while (i < spec.size()) {
+                size_t j = spec.find(',', i);
+                if (j == std::string::npos) j = spec.size();
+                const std::string part = spec.substr(i, j - i);
+                const size_t dash = part.find('-');
+                const int lo = std::stoi(part.substr(0, dash)), hi = dash == std::string::npos ? lo : std::stoi(part.substr(dash + 1));
+                for (int l = lo; l <= hi && l < hp.n_layer; ++l) off[l] = true;
+                i = j + 1;
+            }
+        }
+    }
+    offloaded = off;
+    auto is_off = [&](const std::string & n) {
+        if (n.rfind("blk.", 0) != 0 || n.find("_exps.weight") == std::string::npos) return false;
+        return (bool) off[std::stoi(n.substr(4))];
+    };
+    uint64_t weights = 0, host_need = 0;
+    for (const auto & t : f.tensors()) (is_off(t.name) ? host_need : weights) += t.n_bytes;
     check_fits(q_, weights, "the weights");
+    if (host_need) {
+        // pinned memory cannot be swapped: refuse rather than push the machine into swap (keep 4 GiB spare)
+        uint64_t avail = 0;
+        if (FILE * mi = fopen("/proc/meminfo", "r")) {
+            char key[64];
+            unsigned long long kb;
+            while (fscanf(mi, "%63s %llu kB", key, &kb) == 2)
+                if (std::string(key) == "MemAvailable:") avail = kb << 10;
+            fclose(mi);
+        }
+        if (avail && host_need + (4ull << 30) > avail)
+            throw std::runtime_error("not enough free system RAM for the offloaded experts: need " + std::to_string(host_need >> 20) +
+                                     " MiB + 4096 MiB spare, " + std::to_string(avail >> 20) + " MiB available");
+    }
 
-    auto L = [&](const std::string & n, bool req = true) { return load(q_, f, n, req, weight_bytes, allocs_, repack); };
-    tok_embd = L("token_embd.weight");
+    auto L = [&](const std::string & n, bool req = true) {
+        return load(q_, f, n, req, weight_bytes, allocs_, repack, is_off(n), &host_bytes);
+    };
+    // the embedding is read one row at a time by its file format (decode32), never by a matrix kernel: keep the
+    // file layout (repacking a Q8_0 embedding, as in UD-Q4_K_XL, made every embedding row garbage)
+    tok_embd = load(q_, f, "token_embd.weight", true, weight_bytes, allocs_, false);
     tok_norm = L("token_embd_norm.weight");
     output = L("output.weight");
     output_norm = L("output_norm.weight");

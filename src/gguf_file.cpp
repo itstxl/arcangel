@@ -105,8 +105,8 @@ GgufFile::GgufFile(const std::string & path) {
     if (fstat(fd, &st) != 0) { ::close(fd); throw std::runtime_error("gguf: cannot stat " + path); }
     size_ = (uint64_t) st.st_size;
     map_ = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (map_ == MAP_FAILED) { map_ = nullptr; throw std::runtime_error("gguf: mmap failed for " + path); }
+    if (map_ == MAP_FAILED) { map_ = nullptr; ::close(fd); throw std::runtime_error("gguf: mmap failed for " + path); }
+    fd_ = fd;
 
     const uint8_t * base = (const uint8_t *) map_;
     Cursor c{base, base + size_};
@@ -151,6 +151,17 @@ GgufFile::GgufFile(const std::string & path) {
 
 GgufFile::~GgufFile() {
     if (map_) munmap(map_, size_);
+    if (fd_ >= 0) ::close(fd_);
+}
+
+void GgufFile::release(const uint8_t * p, size_t n) const {
+    if (!map_ || n == 0) return;
+    const uint8_t * base = (const uint8_t *) map_;
+    const size_t pg = 4096, off = (size_t) (p - base);
+    const size_t a = (off + pg - 1) / pg * pg, b = (off + n) / pg * pg;  // whole pages inside the range only
+    if (b <= a) return;
+    madvise((void *) (base + a), b - a, MADV_DONTNEED);
+    if (fd_ >= 0) posix_fadvise(fd_, (off_t) a, (off_t) (b - a), POSIX_FADV_DONTNEED);
 }
 
 const GgufValue * GgufFile::find(const std::string & key) const {

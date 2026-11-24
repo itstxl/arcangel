@@ -64,9 +64,14 @@ public:
     const GgufTensor * tensor(const std::string & name) const;
 
     uint64_t file_size() const { return size_; }
+    // Drop [p, p + n) of the mapping from this process and from the page cache once it has been copied: a 10-18 GB
+    // model file otherwise fills the cache, and with a high vm.swappiness the kernel then swaps out other memory
+    // (including offloaded experts) rather than dropping it.
+    void release(const uint8_t * p, size_t n) const;
 
 private:
     void * map_ = nullptr;
+    int fd_ = -1;
     uint64_t size_ = 0;
     std::map<std::string, GgufValue> meta_;
     std::vector<GgufTensor> tensors_;

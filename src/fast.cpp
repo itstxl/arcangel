@@ -843,20 +843,77 @@ FastEngine::FastEngine(sycl::queue & q, const Model & m, int n_ctx, bool use_gra
 
     if (const char * e = getenv("INK_DOWNQ8")) down_q8 = std::string(e) != "0";
     if (const char * e = getenv("INK_GUR")) gate_up_r = std::string(e) != "0";
+    // expert offloading: offloaded layers in a format the CPU kernels read get their experts computed on the CPU
+    // during decode (ARCANGEL_CPU_EXPERTS=0: the GPU reads them over PCIe instead, as the prompt path does)
+    cpu_layer_.assign(h.n_layer, false);
+    const bool cpu_on = !getenv("ARCANGEL_CPU_EXPERTS") || std::string(getenv("ARCANGEL_CPU_EXPERTS")) != "0";
+    for (int ip = 0; ip < h.n_layer; ++ip)
+        cpu_layer_[ip] = cpu_on && ip < (int) m.offloaded.size() && m.offloaded[ip] && CpuExperts::supports(m.layers[ip].gate_up.ktype) &&
+                         CpuExperts::supports(m.layers[ip].down.ktype);
+    if (std::find(cpu_layer_.begin(), cpu_layer_.end(), true) != cpu_layer_.end()) {
+        cpu_ = std::make_unique<CpuExperts>();
+        hx_ = sycl::malloc_host<float>((size_t) D + 2 * 64, q_);
+        hy_ = sycl::malloc_host<float>(D, q_);
+        allocs_.push_back(hx_);
+        allocs_.push_back(hy_);
+        cpu_gs_.resize(h.n_layer);
+        cpu_ds_.resize(h.n_layer);
+        for (int ip = 0; ip < h.n_layer; ++ip) {
+            if (!cpu_layer_[ip]) continue;
+            const LayerW & L = m.layers[ip];
+            if (L.gate_up_s.ok()) {
+                cpu_gs_[ip].resize(h.n_expert);
+                q_.memcpy(cpu_gs_[ip].data(), L.gate_up_s.p, h.n_expert * sizeof(float));
+            }
+            if (L.down_s.ok()) {
+                cpu_ds_[ip].resize(h.n_expert);
+                q_.memcpy(cpu_ds_[ip].data(), L.down_s.p, h.n_expert * sizeof(float));
+            }
+        }
+        q_.wait();
+    }
     prepare_jobs();
     if (use_graph) build_graph();
 }
 
+int FastEngine::cpu_expert_layers() const { return (int) std::count(cpu_layer_.begin(), cpu_layer_.end(), true); }
+
+void FastEngine::split(int ip) {
+    if (jobs_only_) return;
+    if (rec_) {
+        rec_->end_recording(q_);
+        graphs_.push_back(std::make_unique<ExecGraph>(rec_->finalize()));
+        cpu_seq_.push_back(ip);
+        rec_ = std::make_unique<ModGraph>(q_.get_context(), q_.get_device());
+        rec_->begin_recording(q_);
+    } else {
+        q_.wait();
+        cpu_experts(ip);
+    }
+}
+
+void FastEngine::cpu_experts(int ip) {
+    const Hparams & h = hp_;
+    const LayerW & L = m_.layers[ip];
+    cpu_->run(L.gate_up, cpu_gs_[ip].empty() ? nullptr : cpu_gs_[ip].data(), L.down, cpu_ds_[ip].empty() ? nullptr : cpu_ds_[ip].data(),
+              hx_, (const int32_t *) (hx_ + D), hx_ + D + 64, h.n_used, h.n_ff, D, h.situ_beta, h.situ_lb, hy_);
+}
+
 void FastEngine::build_graph() {
     try {
-        sycl_exp::command_graph<sycl_exp::graph_state::modifiable> g(q_.get_context(), q_.get_device());
-        g.begin_recording(q_);
-        record();
-        g.end_recording(q_);
-        graph_ = std::make_unique<sycl_exp::command_graph<sycl_exp::graph_state::executable>>(g.finalize());
+        graphs_.clear();
+        cpu_seq_.clear();
+        rec_ = std::make_unique<ModGraph>(q_.get_context(), q_.get_device());
+        rec_->begin_recording(q_);
+        record();  // split() ends a segment at every CPU-expert layer
+        rec_->end_recording(q_);
+        graphs_.push_back(std::make_unique<ExecGraph>(rec_->finalize()));
+        rec_.reset();
     } catch (const std::exception & e) {
         std::fprintf(stderr, "fast engine: command graph unavailable (%s), submitting directly\n", e.what());
-        graph_.reset();
+        graphs_.clear();
+        cpu_seq_.clear();
+        rec_.reset();
     }
 }
 
@@ -1358,6 +1415,30 @@ void FastEngine::visit(const Visit & v) {
     run_mv("router", router_plan);
     P("router", k_topk(q_, router_logits_, L.probs_b.ok() ? L.probs_b.f32() : nullptr, h.n_expert, h.n_used, h.w_scale, ids_, wts_));
 
+    // 12 (offloaded layer): the chosen experts on the CPU. The FFN input and the routing go to pinned memory, the
+    // decode graph ends a segment here, the CPU writes the expert sum to hy_, then the convolution and residual.
+    if (cpu_ && cpu_layer_[v.ip]) {
+        P("cpu_x", q_.memcpy(hx_, f_, D * sizeof(float)));
+        P("cpu_x", q_.memcpy(hx_ + D, ids_, h.n_used * sizeof(int32_t)));
+        P("cpu_x", q_.memcpy(hx_ + D + 64, wts_, h.n_used * sizeof(float)));
+        split(v.ip);
+        const float * yv = hy_, * conv = L.ffn_post_conv.f32(), * res = xb_;
+        float * hist = hist_[v.slot] + (size_t) (2 * kvw + D) * 3, * out = xa_;
+        P("cpu_conv", q_.parallel_for(sycl::range<1>(D), [=](sycl::id<1> id) {
+            const int i = (int) id[0];
+            const float y = yv[i];
+            float * hh = hist + (size_t) i * 3;
+            const float xx[4] = {hh[0], hh[1], hh[2], y};
+            float cv = 0.0f;
+            for (int j = 0; j < 4; ++j) cv += conv[j + 4 * i] * xx[j];
+            hh[0] = xx[1];
+            hh[1] = xx[2];
+            hh[2] = xx[3];
+            out[i] = res[i] + (y + cv) * 0.44721359549995793f;  // 1/sqrt(5)
+        }));
+        return;
+    }
+
     // 12a: gate-up of the chosen experts with SITU
     {
         bool q8 = false;
@@ -1446,7 +1527,7 @@ void FastEngine::record() {
     for (size_t i = 0; i < vs.size(); ++i) {
         visit(vs[i]);
         if (run && (int) i + 1 == m_.schedule.prelude_end) P("prelude", q_.memcpy(prelude_, xa_, D * sizeof(float)));
-        if (run && !graph_ && hook) hook("l_out-" + std::to_string(vs[i].slot), xa_, D);
+        if (run && graphs_.empty() && hook) hook("l_out-" + std::to_string(vs[i].slot), xa_, D);
     }
     // output: depth mix with the final blocks, norm, LM head with softcap
     const W & o = m_.output;
@@ -1469,8 +1550,17 @@ const std::vector<float> & FastEngine::step(int token, int pos) {
     if (pos >= n_ctx_) throw std::runtime_error("context is full");
     q_.memcpy(token_, &token, sizeof(int32_t));
     q_.memcpy(pos_, &pos, sizeof(int32_t));
-    if (graph_) q_.ext_oneapi_graph(*graph_);
-    else record();
+    if (!graphs_.empty()) {
+        for (size_t i = 0; i < graphs_.size(); ++i) {
+            q_.ext_oneapi_graph(*graphs_[i]);
+            if (i < cpu_seq_.size()) {
+                q_.wait();
+                cpu_experts(cpu_seq_[i]);
+            }
+        }
+    } else {
+        record();
+    }
     logits_.resize(hp_.n_vocab);
     q_.memcpy(logits_.data(), logits_dev_, hp_.n_vocab * sizeof(float)).wait();
     if (profile && !prof_events_.empty()) {

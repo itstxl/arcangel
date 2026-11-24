@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "cpu_experts.h"
 #include "model.h"
 
 namespace ink {
@@ -77,7 +78,8 @@ public:
 
     const Hparams & hp() const { return hp_; }
     uint64_t weight_bytes() const { return m_.weight_bytes; }
-    bool graph_active() const { return graph_ != nullptr; }
+    bool graph_active() const { return !graphs_.empty(); }
+    int cpu_expert_layers() const;  // offloaded layers whose experts the CPU computes during decode
 
     // Kernel timing by label (needs a queue from make_queue(true) and no graph); print_profile() reports
     // milliseconds per token for each label.
@@ -141,7 +143,20 @@ private:
     bool jobs_only_ = false;
     float * router_logits_ = nullptr;
 
-    std::unique_ptr<sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>> graph_;
+    using ExecGraph = sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>;
+    using ModGraph = sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::modifiable>;
+    // decode graph, split into segments at the layers whose experts the CPU computes (expert offloading): replay
+    // segment i, then the CPU experts of cpu_seq_[i], then segment i + 1
+    std::vector<std::unique_ptr<ExecGraph>> graphs_;
+    std::unique_ptr<ModGraph> rec_;  // the segment being recorded
+    std::vector<int> cpu_seq_;       // physical layer of each split, in decode order
+    void split(int ip);              // end the current segment (graph) or run the CPU experts now (direct)
+    void cpu_experts(int ip);
+    std::unique_ptr<class CpuExperts> cpu_;
+    std::vector<bool> cpu_layer_;    // per physical layer: experts on the CPU during decode
+    std::vector<std::vector<float>> cpu_gs_, cpu_ds_;  // per layer: the experts' gate-up / down scales (host)
+    float * hx_ = nullptr;           // pinned: FFN input (D), then ids (as int32) and weights of the chosen experts
+    float * hy_ = nullptr;           // pinned: the CPU's expert sum (D)
     std::vector<float> logits_;
 
     // prompt chunks: token-major [TB_][...] arrays (prefill.cpp)
