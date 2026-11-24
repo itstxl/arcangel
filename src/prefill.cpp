@@ -1271,11 +1271,10 @@ const std::vector<float> & FastEngine::verify(const std::vector<int> & tokens, i
     }
     verify_ = true;
     vn_ = n;
-    // small batches: the matrix-vector kernels (weights read once for all tokens), not the XMX tiles (built
-    // for 1024-token chunks; INK_VERIFY_XMX=1 to compare)
+    // INK_VERIFY_XMX=0 tries the non-XMX kernels for the batch (measured: slower, 168 ms for 1 token)
     const bool xmx_saved = use_xmx;
-    static const bool vx = getenv("INK_VERIFY_XMX") && std::string(getenv("INK_VERIFY_XMX")) == "1";
-    use_xmx = vx;
+    static const bool vx = !getenv("INK_VERIFY_XMX") || std::string(getenv("INK_VERIFY_XMX")) != "0";
+    use_xmx = use_xmx && vx;
     try {
         q_.memcpy(btok_, tokens.data(), n * sizeof(int32_t));
         embed(n);
