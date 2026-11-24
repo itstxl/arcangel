@@ -28,8 +28,8 @@ speculative decoding.
 | Prompt reading (tokens/s) | ArcAngel | llama.cpp |
 |---|---|---|
 | 4k-token prompt | **900** | ~225 |
-| 16k | **755** | |
-| 32k | **783** | |
+| 16k | **825** | |
+| 32k | **780** | |
 | 90k | **627** (144 s) | (does not fit) |
 
 Accuracy: against llama.cpp's CPU output the engine matches the top token on every step tested, with KL
