@@ -19,7 +19,7 @@ struct Init {
     Init() {
         for (int i = 0; i < 256; ++i) g_ue4m3[i] = q::ue4m3((uint8_t) i);
     }
-} g_init;
+} g_init [[maybe_unused]];
 
 inline float h2f(const uint8_t * p) {
     uint16_t h;

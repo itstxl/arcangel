@@ -4,6 +4,8 @@
 #include "gguf_file.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <vector>
 #include <map>
 #include <string>
 
@@ -32,6 +34,31 @@ int main(int argc, char ** argv) {
             total += t.n_bytes;
         }
         std::printf("weights: %.2f GiB\n", gib(total));
+        // INK_OFFLOAD (a layer list such as "0-5,18-23", or "once"): the routed experts that would stay in RAM
+        if (const char * e = std::getenv("INK_OFFLOAD"); e && *e && std::string(e) != "none") {
+            const int nl = (int) f.get(arch + ".block_count").as_int();
+            const int ls = (int) f.get(arch + ".loop.start").as_int(), le = (int) f.get(arch + ".loop.end").as_int();
+            std::vector<bool> off(nl, false);
+            const std::string spec = e;
+            if (spec == "once") {
+                for (int i = 0; i < nl; ++i) off[i] = i < ls || i >= le;
+            } else {
+                for (size_t i = 0; i < spec.size();) {
+                    size_t j = spec.find(',', i);
+                    if (j == std::string::npos) j = spec.size();
+                    const std::string part = spec.substr(i, j - i);
+                    const size_t dash = part.find('-');
+                    const int lo = std::stoi(part.substr(0, dash)), hi = dash == std::string::npos ? lo : std::stoi(part.substr(dash + 1));
+                    for (int l = lo; l <= hi && l < nl; ++l) off[l] = true;
+                    i = j + 1;
+                }
+            }
+            uint64_t host = 0;
+            for (const auto & t : f.tensors())
+                if (t.name.rfind("blk.", 0) == 0 && t.name.find("_exps.weight") != std::string::npos && off[std::stoi(t.name.substr(4))])
+                    host += t.n_bytes;
+            std::printf("offloaded to system RAM: %.2f GiB\n", gib(host));
+        }
         for (const auto & [name, bytes] : by_type) std::printf("  %-8s %7.3f GiB\n", name.c_str(), gib(bytes));
 
         sycl::queue q = ink::make_queue();

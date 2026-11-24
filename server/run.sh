@@ -22,5 +22,7 @@ args=(--model "$model")
 [ -n "$ARCANGEL_HOST" ] && args+=(--host "$ARCANGEL_HOST")
 [ -n "$ARCANGEL_PORT" ] && args+=(--port "$ARCANGEL_PORT")
 [ -n "$ARCANGEL_REASONING" ] && args+=(--reasoning-effort "$ARCANGEL_REASONING")
+# offload recipe: these layers' routed experts stay in pinned system RAM (see cards.tsv)
+[ -n "$ARCANGEL_OFFLOAD" ] && export INK_OFFLOAD=$ARCANGEL_OFFLOAD
 [ -n "$ARCANGEL_STASH_RAM_GB" ] && args+=(--stash-ram-gb "$ARCANGEL_STASH_RAM_GB")
 exec "$here/.venv/bin/python" -u "$here/inkling_server.py" "${args[@]}" "$@"

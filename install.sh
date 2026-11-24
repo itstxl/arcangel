@@ -6,7 +6,8 @@
 #   ./install.sh --list-cards
 #
 # What it does (each step skips itself when already done, so re-running is safe):
-#   1. picks the card profile (cards.tsv): which quant to download, context length, K/V cache bits
+#   1. picks the card profile (cards.tsv) and the setup: "vram" (everything on the card: faster, smaller quant
+#      or context) or "offload" (part of the experts in system RAM: better quant or more context, slower)
 #   2. checks the build tools and GPU runtime (on Arch-based systems it can install them with pacman)
 #   3. downloads the model from Hugging Face (unsloth/Inkling-2-Mini-GGUF) and the tokenizer and chat
 #      template (thinkingmachines/Inkling-2-Mini)
@@ -27,7 +28,7 @@ BASE_REPO=thinkingmachines/Inkling-2-Mini
 TOKENIZER_SHA=7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6
 TEMPLATE_SHA=53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc
 
-card="" model="" port=8082 ctx="" kv="" yes=0 deps=1 build_only=0 service=1 opencode=1 start=1 models_dir="$DATA/models"
+setup="" card="" model="" port=8082 ctx="" kv="" yes=0 deps=1 build_only=0 service=1 opencode=1 start=1 models_dir="$DATA/models"
 
 usage() {
   sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
@@ -35,6 +36,7 @@ usage() {
 
 Options:
   --card ID          card profile (see --list-cards); default: detected
+  --setup vram|offload  full-VRAM recipe (default) or the offload recipe (needs ~32 GB of system RAM)
   --model FILE       use a GGUF you already have instead of downloading
   --models-dir DIR   where to download models (default: $DATA/models)
   --ctx N            context length (default: the card's profile)
@@ -53,6 +55,7 @@ EOF
 while [ $# -gt 0 ]; do
   case $1 in
     --card) card=$2; shift ;;
+    --setup) setup=$2; shift ;;
     --model) model=$2; shift ;;
     --models-dir) models_dir=$2; shift ;;
     --ctx) ctx=$2; shift ;;
@@ -93,8 +96,9 @@ field() {  # field ID COLUMN
 }
 
 if [ "${list:-0}" = 1 ]; then
-  printf '%-6s %-22s %-8s %-9s %-8s %-6s %s\n' card name chip quant context kv status
-  profiles | awk -F'\t' '{ printf "%-6s %-22s %-8s %-9s %-8s %-6s %s\n", $1, $9, $2, $4, $6, $5"-bit", $7 }'
+  printf '%-6s %-22s  %-34s  %s\n' card name "full VRAM (--setup vram)" "offload (--setup offload)"
+  profiles | awk -F'\t' '{ printf "%-6s %-22s  %-8s %5dk %s-bit %-10s  %-8s %5dk %s-bit, experts of layers %s in RAM, %s\n",
+    $1, $9, $4, $6 / 1024, $5, $7, $10, $12 / 1024, $11, $13, $14 }'
   exit 0
 fi
 
@@ -120,7 +124,7 @@ if [ -z "$card" ]; then
   else
     echo
     i=0; ids=()
-    while IFS=$'\t' read -r id chip vram quant kvb n status _ name; do
+    while IFS=$'\t' read -r id chip vram quant kvb n status _ name _rest; do
       i=$((i + 1)); ids+=("$id")
       mark=""; [ "$id" = "$detected" ] && mark=" ${G}<- detected${N}"
       note=""; [ "$status" = untested ] && note=" (untested)"
@@ -135,18 +139,80 @@ if [ -z "$card" ]; then
   fi
 fi
 [ -n "$(field "$card" 1)" ] || die "unknown card '$card' (see --list-cards)"
-chip=$(field "$card" 2); quant=$(field "$card" 4); status=$(field "$card" 7); cname=$(field "$card" 9)
-ctx=${ctx:-$(field "$card" 6)}; kv=${kv:-$(field "$card" 5)}
+chip=$(field "$card" 2); cname=$(field "$card" 9)
+mem_gib=$(awk '/MemTotal/ { printf "%d", $2 / 1048576 + 0.5 }' /proc/meminfo 2>/dev/null || echo 0)
+if [ -z "$setup" ]; then
+  if [ $yes = 1 ] || [ $build_only = 1 ]; then
+    setup=vram
+  else
+    echo
+    echo "  Two setups for the $cname:"
+    printf '    1) Full VRAM   %-8s %5sk context, %s-bit cache   everything on the card: fastest (%s)\n' \
+      "$(field "$card" 4)" $(( $(field "$card" 6) / 1024 )) "$(field "$card" 5)" "$(field "$card" 7)"
+    printf '    2) Offload     %-8s %5sk context, %s-bit cache   better quant or more context, about half the\n' \
+      "$(field "$card" 10)" $(( $(field "$card" 12) / 1024 )) "$(field "$card" 11)"
+    printf '                   generation speed: part of the experts in system RAM, needs ~32 GB of RAM (%s)\n' "$(field "$card" 14)"
+    echo   "                   (this machine has ${mem_gib} GB)"
+    read -r -p "  Which setup? [1] " pick
+    case ${pick:-1} in 1) setup=vram ;; 2) setup=offload ;; *) die "no such choice: $pick" ;; esac
+  fi
+fi
+case $setup in
+  vram)
+    quant=$(field "$card" 4); status=$(field "$card" 7); offload=""
+    ctx=${ctx:-$(field "$card" 6)}; kv=${kv:-$(field "$card" 5)} ;;
+  offload)
+    quant=$(field "$card" 10); status=$(field "$card" 14); offload=$(field "$card" 13)
+    ctx=${ctx:-$(field "$card" 12)}; kv=${kv:-$(field "$card" 11)}
+    [ "$mem_gib" -ge 28 ] || warn "the offload setup keeps ~8-9 GB of experts in RAM and wants ~32 GB in total; this machine has ${mem_gib} GB" ;;
+  *) die "--setup must be vram or offload" ;;
+esac
 [[ $kv =~ ^(4|8)$ ]] || die "--kv-bits must be 4 or 8"
 [[ $ctx =~ ^[0-9]+$ ]] && [ "$ctx" -ge 4096 ] || die "--ctx must be a number >= 4096"
 gguf_name=Inkling-2-Mini-UD-$quant.gguf
-ok "$cname: $gguf_name, $((ctx / 1024))k context, $kv-bit K/V cache, chip $chip"
+ok "$cname, $setup setup: $gguf_name, $((ctx / 1024))k context, $kv-bit K/V cache, chip $chip${offload:+, experts of layers $offload in RAM}"
 if [ "$status" = untested ]; then
   warn "this profile has not been run on a real $cname yet; the numbers come from its memory size."
   warn "If the server refuses to start for lack of VRAM, re-run with a smaller --ctx or --kv-bits 4."
 fi
 if [ -n "$detected" ] && [ "$detected" != "$card" ]; then
   warn "the detected card is '$detected', not '$card'"
+fi
+
+# ------------------------------------------------------------------------------------------------------
+# the plan: everything the installer will do, confirmed once (then no more questions)
+if [ $yes = 0 ] && [ $build_only = 0 ]; then
+  have_model=""
+  if [ -n "$model" ]; then have_model=$model; else
+    for d in "$models_dir" "$HOME/.local/share/llama.cpp/models" "$HOME/models"; do
+      [ -f "$d/$gguf_name" ] && { have_model=$d/$gguf_name; break; }
+    done
+  fi
+  echo
+  echo "${B}==> Plan${N}"
+  echo "  setup:     $cname, $setup: $quant, $((ctx / 1024))k context, $kv-bit K/V cache${offload:+, experts of layers $offload in RAM}"
+  if [ -n "$have_model" ]; then
+    echo "  model:     use $have_model"
+  else
+    sz=$(curl -fsSL "https://huggingface.co/api/models/$GGUF_REPO/tree/main" 2>/dev/null |
+         python3 -c "import json,sys; print(next((f.get('size',0) for f in json.load(sys.stdin) if f['path']=='$gguf_name'),0))" 2>/dev/null || echo 0)
+    echo "  model:     download $gguf_name ($(awk -v b="$sz" 'BEGIN { printf "%.1f", b / 1e9 }') GB) to $models_dir"
+  fi
+  echo "  packages:  install the compiler / GPU runtime if missing (your package manager, asks for your password)"
+  echo "  build:     compile the engine for $chip (a few minutes)"
+  if [ $service = 1 ] && command -v systemctl >/dev/null 2>&1; then
+    echo "  service:   'arcangel' (systemd user service), API on http://127.0.0.1:$port/v1, started at the end"
+  fi
+  if [ $opencode = 1 ] && { [ -f "$OPENCODE_JSON" ] || command -v opencode >/dev/null 2>&1; }; then
+    echo "  opencode:  add the model to $OPENCODE_JSON (a backup is kept)"
+  fi
+  echo
+  if [ $service = 1 ] && command -v systemctl >/dev/null 2>&1; then
+    if ask "Start ArcAngel automatically when you log in? (it holds most of the card's memory while running)" n; then
+      autostart=1; else autostart=0; fi
+  fi
+  ask "Go ahead?" y || { echo "  nothing changed"; exit 0; }
+  yes=1  # confirmed: no more questions from here on
 fi
 
 # ------------------------------------------------------------------------------------------------------
@@ -380,7 +446,7 @@ fi
 
 # check the formats and the card's memory against the model (reads the header, moves ~64 MiB through the GPU)
 export LD_LIBRARY_PATH=$ONEAPI_ROOT/compiler/latest/lib:$ONEAPI_ROOT/tbb/latest/lib:$ONEAPI_ROOT/umf/latest/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-probe=$("$build/ink-probe" "$model" 2>&1) || {
+probe=$(INK_OFFLOAD=$offload "$build/ink-probe" "$model" 2>&1) || {
   echo "$probe" | tail -5 | sed 's/^/    /'
   die "ink-probe failed: unsupported model file or no usable GPU (see above)"
 }
@@ -391,6 +457,10 @@ python3 - "$probe" "$ctx" "$kv" <<'PY' || true
 import re, sys
 probe, ctx, kv = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 w = float(re.search(r"^weights: ([0-9.]+) GiB", probe, re.M).group(1))
+off = re.search(r"^offloaded to system RAM: ([0-9.]+) GiB", probe, re.M)
+if off:
+    w -= float(off.group(1))
+    print(f"  {float(off.group(1)):.1f} GiB of experts in system RAM (pinned)")
 m = re.search(r"memory ([0-9.]+) GiB total, ([0-9.]+) GiB free", probe)
 kvg = ctx * 8 * 2 * 1024 * (kv / 8 + 2 / 32) / 2**30
 need = w + kvg + 0.45 + 0.5
@@ -415,6 +485,8 @@ ARCANGEL_MODEL=$model
 ARCANGEL_ASSETS=$assets
 ARCANGEL_CTX=$ctx
 ARCANGEL_KV_BITS=$kv
+ARCANGEL_SETUP=$setup
+ARCANGEL_OFFLOAD=$offload
 ARCANGEL_PORT=$port
 ARCANGEL_REASONING=low
 # ARCANGEL_STASH_RAM_GB=8   # host RAM for stashed conversations (default: a quarter of RAM)
@@ -440,7 +512,7 @@ WantedBy=default.target
 EOF
   systemctl --user daemon-reload
   ok "systemd user service 'arcangel' (systemctl --user start|stop|status arcangel)"
-  if ask "Start ArcAngel automatically when you log in?" n; then
+  if [ "${autostart:-}" = 1 ] || { [ -z "${autostart:-}" ] && ask "Start ArcAngel automatically when you log in?" n; }; then
     systemctl --user enable arcangel >/dev/null 2>&1 && ok "enabled at login"
   fi
 fi
@@ -452,9 +524,9 @@ if [ $opencode = 1 ] && { [ -f "$OPENCODE_JSON" ] || have opencode; }; then
   if ask "Add ArcAngel to opencode ($OPENCODE_JSON)?" y; then
     mkdir -p "$(dirname "$OPENCODE_JSON")"
     [ -f "$OPENCODE_JSON" ] && cp "$OPENCODE_JSON" "$OPENCODE_JSON.bak-arcangel"
-    if python3 - "$OPENCODE_JSON" "$port" "$ctx" "$cname" <<'EOF'
+    if python3 - "$OPENCODE_JSON" "$port" "$ctx" "$cname" "$quant" <<'EOF'
 import json, sys
-path, port, ctx, card = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+path, port, ctx, card, quant = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
 try:
     cfg = json.load(open(path))
 except FileNotFoundError:
@@ -464,7 +536,7 @@ cfg.setdefault("provider", {})["arcangel"] = {
     "name": "ArcAngel",
     "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
     "models": {"inkling-2-mini": {
-        "name": f"Inkling 2 Mini (ArcAngel, {ctx // 1024}k)",
+        "name": f"Inkling 2 Mini (ArcAngel, {quant}, {ctx // 1024}k)",
         "tool_call": True, "reasoning": True,
         "limit": {"context": ctx, "output": 8192}}},
 }
@@ -508,7 +580,8 @@ if [ $service = 1 ] && [ $start = 1 ] && have systemctl; then
 fi
 
 echo
-echo "${B}Done.${N} ArcAngel: $cname, $gguf_name, $((ctx / 1024))k context."
+echo "${B}Done.${N} ArcAngel: $cname, $setup setup, $gguf_name, $((ctx / 1024))k context."
+echo "  switch:      ./install.sh --card $card --setup $([ $setup = vram ] && echo offload || echo vram)"
 if [ $service = 1 ]; then
   echo "  start/stop:  systemctl --user start arcangel / systemctl --user stop arcangel"
   echo "  logs:        journalctl --user -u arcangel -f"

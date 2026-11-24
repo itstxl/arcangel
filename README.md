@@ -44,45 +44,73 @@ git clone https://github.com/itstxl/arcangel && cd arcangel
 ./install.sh
 ```
 
-The installer detects the card, asks before it changes anything, and:
+That is all. The installer asks two questions, which card (it detects yours) and which setup (full VRAM or
+offload, see below), shows a plan of what it will do, and after one "Go ahead?" does the rest:
 
-1. picks the profile for the card (below): which quantisation to download, context length, cache precision
-2. checks the compiler and GPU runtime; on Arch-based distributions it can install them with pacman
-3. downloads the model from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF),
-   reusing a copy that is already on disk
-4. builds the engine for the card's chip (kernels compiled ahead of time; takes a few minutes)
-5. writes `~/.config/arcangel/arcangel.env` and a systemd user service, `arcangel`
-6. adds the model to opencode, if you use it, and starts the server
+1. installs the compiler and GPU runtime if they are missing (asks for your password)
+2. downloads the model from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF),
+   or reuses a copy already on disk
+3. builds the engine for your card (a few minutes)
+4. sets up the `arcangel` service and, if you use opencode, adds the model to it
+5. starts the server and checks that it answers
 
-Re-running it is safe; it skips what is already done. `./install.sh --help` lists the options (choose the card,
-use your own GGUF, change context or port, run without questions). `./uninstall.sh` removes the service, the
-opencode entry and the settings, and keeps the downloaded model unless you pass `--models`.
+Running it again is safe (it skips what is done) and is also how you change card or setup. To remove
+everything: `./uninstall.sh` (the downloaded model is kept unless you add `--models`).
 
-### Card profiles
+<details><summary>Advanced: options for scripted installs</summary>
 
-| Card | VRAM | Model | Context | K/V cache | Status |
-|---|---|---|---|---|---|
-| Arc B570 | 10 GB | UD-IQ1_S (7.8 GB) | 32k | 4-bit | untested |
-| Arc B580 | 12 GB | UD-Q2_K_XL (9.1 GB) | 96k | 4-bit | **tested** |
-| Arc Pro B50 | 16 GB | UD-Q2_K_XL (9.1 GB) | 256k | 8-bit | untested |
-| Arc Pro B60 | 24 GB | UD-Q4_K_XL (17.6 GB) | 256k | 8-bit | untested |
-| Arc Pro B70 | 32 GB | UD-Q4_K_XL (17.6 GB) | 512k | 8-bit | untested |
+`./install.sh --help` lists them: `--card ID --setup vram|offload -y` installs without questions; `--model FILE`
+uses a GGUF you already have; `--ctx N`, `--kv-bits 4|8` and `--port N` override the recipe;
+`--no-service`, `--no-opencode`, `--no-deps` skip steps; `--build-only` only builds; `--list-cards` prints every
+card's two recipes.
+</details>
 
-The profiles live in [cards.tsv](cards.tsv). Only the B580 has run the whole setup. The other profiles were
-sized from each card's memory: weights, plus the K/V cache, plus prompt buffers, plus a 0.5 GB margin, plus
-about 1 GB for a desktop on the same card. What has been checked for them:
+### Two setups per card
+
+Every card has two recipes, and the installer asks which one you want (`--setup vram` or `--setup offload`):
+
+- **Full VRAM**: the whole model on the card. Fastest, but the card's memory decides the quant and the context.
+- **Offload**: the routed experts of the 12 layers that run once per token (layers 0-5 and 18-23; the 12 in the
+  loop run three times) stay in pinned system RAM, and the CPU computes them during generation. The card then
+  has room for a better quant (B570, B580, B50) or far more context (B60, B70). Generation is about half as
+  fast, and it needs ~32 GB of system RAM (8.3 GB of experts locked in memory, plus headroom).
+
+| Card | Full VRAM: model, context, cache | Offload: model, context, cache | Status |
+|---|---|---|---|
+| Arc B570, 10 GB | UD-IQ1_S, 32k, 4-bit | UD-Q4_K_XL, 32k, 4-bit (one more loop layer in RAM) | both untested |
+| Arc B580, 12 GB | UD-Q2_K_XL, 96k, 4-bit | UD-Q4_K_XL, 96k, 4-bit | **both tested** |
+| Arc Pro B50, 16 GB | UD-Q2_K_XL, 256k, 8-bit | UD-Q4_K_XL, 256k, 8-bit | both untested |
+| Arc Pro B60, 24 GB | UD-Q4_K_XL, 256k, 8-bit | UD-Q4_K_XL, 1M, 4-bit | both untested |
+| Arc Pro B70, 32 GB | UD-Q4_K_XL, 512k, 8-bit | UD-Q4_K_XL, 1M, 8-bit | both untested |
+
+Measured on the B580 (Ryzen 5 5600X, 32 GB DDR4):
+
+| | Full VRAM (Q2_K_XL) | Offload (Q4_K_XL) |
+|---|---|---|
+| Generation, short context | 62-65 tok/s | 32 tok/s |
+| Generation at 30k | 56 tok/s | 29-32 tok/s |
+| Prompt reading, 4k / 20k | 900 / ~800 tok/s | 368 / ~290 tok/s |
+| Weights in VRAM / in RAM | 8.5 / 0 GiB | 8.1 / 8.3 GiB |
+
+Where the offload setup's time goes: per token, the GPU works ~15 ms and the CPU ~14 ms reading 0.53 GB of
+experts from RAM at ~37 GB/s, which is what dual-channel DDR4 delivers. Faster RAM (DDR5) speeds it up
+directly. Switch setups any time with `./install.sh --card <card> --setup vram|offload`.
+
+The profiles live in [cards.tsv](cards.tsv). Only the B580 has run them. The others were sized from each
+card's memory: weights, plus the K/V cache, plus prompt buffers, plus a 0.5 GB margin, plus about 1 GB for a
+desktop on the same card. What has been checked for them:
 
 - the weight formats of Q4_K_XL and Q4_K_M (Q8_0 and Q5_K experts) match llama.cpp on a B580
-  (`tests/format_test.sh`);
-- the engine builds for the B70's chip (BMG-G31).
+  (`tests/format_test.sh`), and Q4_K_XL runs end to end on a B580 in the offload setup;
+- the engine builds for the B70's chip (BMG-G31);
+- contexts above 96k have not been run on any card yet.
 
 If you run one of the untested cards, please report how it went. If a profile does not fit (for example,
 because the desktop uses more VRAM), re-run the installer with a smaller `--ctx` or with `--kv-bits 4`.
 
 Why these models:
-- The B60 and B70 get Q4_K_XL, not Q8_K_XL. Both use the same NVFP4 experts for 40 of the 48 expert tensors;
-  Q8_K_XL only widens the dense layers to BF16, which costs bandwidth for little gain. The B70 spends its
-  extra memory on context instead.
+- Q8_K_XL is not used: its experts are the same NVFP4 as Q4_K_XL's in layers 0-19; it only widens the dense
+  layers and layers 20-23 (already Q8_0 in Q4_K_XL) to BF16. So the B60 and B70 spend memory on context.
 - Q3_K_XL, IQ3_XXS and IQ4_XS use weight formats the engine does not support yet (Q3_K, IQ3_S, IQ4_NL, Q5_0).
 
 ## Use

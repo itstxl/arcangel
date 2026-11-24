@@ -4,6 +4,7 @@
 #include "quant.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -895,6 +896,13 @@ void FastEngine::split(int ip) {
 void FastEngine::cpu_experts(int ip) {
     const Hparams & h = hp_;
     const LayerW & L = m_.layers[ip];
+    static FILE * route_log = getenv("INK_ROUTE_LOG") ? fopen(getenv("INK_ROUTE_LOG"), "a") : nullptr;  // developer aid
+    if (route_log) {
+        const int32_t * ids = (const int32_t *) (hx_ + D);
+        fprintf(route_log, "%d", ip);
+        for (int k = 0; k < h.n_used; ++k) fprintf(route_log, " %d", ids[k]);
+        fprintf(route_log, "\n");
+    }
     cpu_->run(L.gate_up, cpu_gs_[ip].empty() ? nullptr : cpu_gs_[ip].data(), L.down, cpu_ds_[ip].empty() ? nullptr : cpu_ds_[ip].data(),
               hx_, (const int32_t *) (hx_ + D), hx_ + D + 64, h.n_used, h.n_ff, D, h.situ_beta, h.situ_lb, hy_);
 }
@@ -1551,12 +1559,27 @@ const std::vector<float> & FastEngine::step(int token, int pos) {
     q_.memcpy(token_, &token, sizeof(int32_t));
     q_.memcpy(pos_, &pos, sizeof(int32_t));
     if (!graphs_.empty()) {
+        static const bool tm = getenv("INK_CPU_TIME") != nullptr;  // developer aid: GPU vs CPU time per token
+        using clk = std::chrono::steady_clock;
+        double gpu_ms = 0, cpu_ms = 0;
         for (size_t i = 0; i < graphs_.size(); ++i) {
+            const auto t0 = clk::now();
             q_.ext_oneapi_graph(*graphs_[i]);
             if (i < cpu_seq_.size()) {
                 q_.wait();
+                const auto t1 = clk::now();
                 cpu_experts(cpu_seq_[i]);
+                if (tm) {
+                    gpu_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    cpu_ms += std::chrono::duration<double, std::milli>(clk::now() - t1).count();
+                }
             }
+        }
+        if (tm) {
+            static double g = 0, c = 0;
+            static int n = 0;
+            g += gpu_ms, c += cpu_ms;
+            if (++n % 16 == 0) std::fprintf(stderr, "per token: GPU segments %.2f ms, CPU experts %.2f ms\n", g / n, c / n);
         }
     } else {
         record();
