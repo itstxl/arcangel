@@ -85,8 +85,15 @@ oneAPI 2026.0, Unsloth UD-Q2_K_XL. Run-to-run noise is about ±10% on short runs
     step. Now a sub-group step covers 4 consecutive keys, a lane per (key, 32 dims): 16-byte loads, 256
     contiguous bytes per load instruction, partial sums folded with two sub-group shuffles. Decode 42.3 ->
     45.7 tok/s at 90k, 53.7 -> 56.0 at 30k, +1.7% at 2k.
-15. Prompt attention at long context: 27% of a 32k prompt (11.3 s), ~4-5 TFLOPS on the XMX units; larger query
-    blocks (QB=32) would halve the per-block K/V staging but need ~130 registers (large-GRF mode). Not done.
+15. **Prompt attention was limited by the relative-position bias, not by the matrix units** (2026-11-25, EU
+    stall sampling): the softmax step read 16 bias values per (row, key) from global memory with distance-
+    dependent addresses, and the sliding-window layers bias every key. Each K tile now stages the ~47 distances
+    it needs into local memory with coalesced loads: attention -15% (16k: 4.16 -> 3.53 s), 16k prompt
+    20.2 -> 19.1 s. Tried and slower: 32-query blocks with 512-thread work-groups (no register cost, but the
+    K/V staging was not the limit and bigger groups wait longer at barriers: 4.41 s), 64-key tiles (5.13 s),
+    the bias as a small XMX product per tile (3.69 s, and f16 bias), the row's bias weights in a register
+    array (spilled: ~10 s). The prompt GEMMs (`k_xmm`, `k_gxmm`) show the decode kernels' pattern: 63-67%
+    active, 27-42% of instructions are moves (weights unpacked into the XMX layout).
 13. **Prompt buffers 119k -> 72k floats per token**: one pool for buffers with disjoint lifetimes within a
     layer visit (controller temporaries / attention buffers / FFN inputs and expert activations / second
     output), and the depth-mix states in f16. 96k + 4-bit + 1024-token chunks = 1303 MiB; the engine picks
