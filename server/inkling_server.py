@@ -14,6 +14,8 @@ import ctypes
 import json
 import os
 import re
+import select
+import socket
 import sys
 import threading
 import time
@@ -331,8 +333,9 @@ class Server:
                                   reasoning_effort=effort, add_generation_prompt=True)
         return prompt
 
-    def generate(self, body, emit):
-        """Run one chat completion; emit(kind, value) for streaming. Returns the final result dict."""
+    def generate(self, body, emit, gone=None):
+        """Run one chat completion; emit(kind, value) for streaming. Returns the final result dict.
+        gone(): True when the client has disconnected (checked every 16 tokens; generation stops)."""
         prompt = self.render(body)
         toks = self.tok.encode(prompt, add_special_tokens=False).ids
         max_new = int(body.get("max_completion_tokens") or body.get("max_tokens") or self.args.max_tokens)
@@ -348,9 +351,11 @@ class Server:
         pos = len(toks)
         stop_id = self.ids[T_STOP]
         n_gen, finish = 0, "length"
+        gen = []
         while n_gen < max_new:
             t = sample(self.eng.logits, temp, top_p, top_k, rng)
             n_gen += 1
+            gen.append(t)
             if t == stop_id or t == self.tok.token_to_id("<|endoftext|>"):
                 finish = "stop"
                 break
@@ -359,10 +364,16 @@ class Server:
                 emit(kind, val)
             if pos + 1 >= self.eng.n_ctx:
                 break
+            if gone is not None and n_gen % 16 == 0 and gone():
+                finish = "cancelled"
+                break
             self.eng.step(t, pos)
             self.eng.tokens.append(t)
             pos += 1
         t2 = time.time()
+        if os.environ.get("ARCANGEL_TRACE"):  # developer aid: the token ids of every request, one JSON line each
+            with open(os.environ["ARCANGEL_TRACE"], "a") as f:
+                f.write(json.dumps({"prompt": toks, "gen": gen, "temp": temp}) + "\n")
         if parser.mode in ("think", "text"):
             parser._flush(final=True)
             for kind, val in parser.take():
@@ -383,6 +394,14 @@ def make_handler(server):
 
         def log_message(self, fmt, *a):
             pass
+
+        def gone(self):
+            """The client closed the connection (readable with no data = EOF)."""
+            try:
+                r, _, _ = select.select([self.connection], [], [], 0)
+                return bool(r) and self.connection.recv(1, socket.MSG_PEEK) == b""
+            except OSError:
+                return True
 
         def _json(self, code, obj):
             data = json.dumps(obj).encode()
@@ -442,7 +461,10 @@ def make_handler(server):
 
                     try:
                         chunk({"role": "assistant", "content": ""})
-                        res = server.generate(body, emit)
+                        res = server.generate(body, emit, self.gone)
+                        if res["finish"] == "cancelled":
+                            print("client went away: generation stopped", flush=True)
+                            return
                         t = res["timing"]
                         usage = {"prompt_tokens": t["prompt_tokens"], "completion_tokens": t["completion_tokens"],
                                  "total_tokens": t["prompt_tokens"] + t["completion_tokens"]}
@@ -466,7 +488,10 @@ def make_handler(server):
                         parts[kind].append(val)
 
                 try:
-                    res = server.generate(body, emit)
+                    res = server.generate(body, emit, self.gone)
+                    if res["finish"] == "cancelled":
+                        print("client went away: generation stopped", flush=True)
+                        return
                 except Exception as e:
                     return self._json(500, {"error": {"message": str(e)}})
                 msg = {"role": "assistant", "content": "".join(parts["content"]) or None}
@@ -502,7 +527,13 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=8192)
     args = ap.parse_args()
     server = Server(args)
-    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(server))
+    class Quiet(ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)):
+                return  # a client hung up mid-request: nothing to report
+            super().handle_error(request, client_address)
+
+    httpd = Quiet((args.host, args.port), make_handler(server))
     print(f"listening on http://{args.host}:{args.port}", flush=True)
     httpd.serve_forever()
 

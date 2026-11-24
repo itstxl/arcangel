@@ -27,7 +27,7 @@ BASE_REPO=thinkingmachines/Inkling-2-Mini
 TOKENIZER_SHA=7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6
 TEMPLATE_SHA=53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc
 
-card="" model="" port=8082 ctx="" kv="" yes=0 deps=1 service=1 opencode=1 start=1 models_dir="$DATA/models"
+card="" model="" port=8082 ctx="" kv="" yes=0 deps=1 build_only=0 service=1 opencode=1 start=1 models_dir="$DATA/models"
 
 usage() {
   sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
@@ -45,6 +45,7 @@ Options:
   --no-start         write the service but do not start it
   --no-opencode      do not touch the opencode config
   -y, --yes          accept the defaults, ask nothing
+  --build-only       install the build tools and build the engine, nothing else (no GPU needed)
   --list-cards       show the card profiles and exit
 EOF
 }
@@ -62,6 +63,7 @@ while [ $# -gt 0 ]; do
     --no-start) start=0 ;;
     --no-opencode) opencode=0 ;;
     -y|--yes) yes=1 ;;
+    --build-only) build_only=1 ;;
     --list-cards) list=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
@@ -105,11 +107,12 @@ gpus=$(lspci -nn 2>/dev/null | grep -Ei 'vga|display|3d' | grep -i '8086:' || tr
 detected=""
 if [ -n "$gpus" ]; then
   while IFS=$'\t' read -r id _ _ _ _ _ _ match _; do
-    if echo "$gpus" | grep -Eqi "$match"; then detected=$id; break; fi
+    if grep -Eqi "$match" <<<"$gpus"; then detected=$id; break; fi
   done < <(profiles)
 fi
 [ -n "$gpus" ] && echo "$gpus" | sed 's/^/  found: /'
 
+[ $build_only = 1 ] && [ -z "$card" ] && card=${detected:-b580}
 if [ -z "$card" ]; then
   if [ $yes = 1 ]; then
     [ -n "$detected" ] || die "could not detect the card: pass --card (see --list-cards)"
@@ -149,57 +152,165 @@ fi
 # ------------------------------------------------------------------------------------------------------
 step "2/6 Build tools and GPU runtime"
 
-missing=()
 have() { command -v "$1" >/dev/null 2>&1; }
-[ -x "$ONEAPI_ROOT/compiler/latest/bin/icpx" ] || have icpx || missing+=(icpx)
-have ocloc || missing+=(ocloc)
-ldconfig -p 2>/dev/null | grep -q 'libze_loader.so' || [ -e /usr/lib/libze_loader.so.1 ] || missing+=(level-zero)
-ldconfig -p 2>/dev/null | grep -q 'libze_intel_gpu.so' || ls /usr/lib*/libze_intel_gpu.so* >/dev/null 2>&1 || missing+=(gpu-driver)
-have cmake || missing+=(cmake)
-have python3 || missing+=(python3)
-have curl || missing+=(curl)
-python3 -c 'import venv, ensurepip' 2>/dev/null || missing+=(python3-venv)
+# distribution family from /etc/os-release: arch, debian (Ubuntu, Debian, Mint, Pop!_OS...), fedora, or other
+distro=other
+if [ -r /etc/os-release ]; then
+  ids=$(. /etc/os-release; echo "${ID:-} ${ID_LIKE:-}")
+  case " $ids " in
+    *" arch "*|*" archlinux "*) distro=arch ;;
+    *" debian "*|*" ubuntu "*) distro=debian ;;
+    *" fedora "*|*" rhel "*) distro=fedora ;;
+  esac
+fi
 
+ldcache=$( { ldconfig -p || /sbin/ldconfig -p; } 2>/dev/null || true)
+libfound() { [[ $ldcache == *"$1"* ]] || compgen -G "/usr/lib*/$1*" >/dev/null || compgen -G "/usr/lib/*/$1*" >/dev/null; }
+missing_deps() {
+  missing=()
+  [ -x "$ONEAPI_ROOT/compiler/latest/bin/icpx" ] || have icpx || missing+=(oneapi-compiler)
+  have ocloc || missing+=(ocloc)
+  libfound libze_loader.so || missing+=(level-zero)
+  libfound libze_intel_gpu.so || missing+=(gpu-compute-runtime)
+  have cmake || missing+=(cmake)
+  have python3 || missing+=(python3)
+  have curl || missing+=(curl)
+  have git || missing+=(git)
+  have python3 && { python3 -c 'import venv, ensurepip' 2>/dev/null || missing+=(python3-venv); }
+  return 0
+}
+
+install_deps() {
+  case $distro in
+    arch)
+      sudo pacman -S --needed --noconfirm intel-oneapi-dpcpp-cpp intel-compute-runtime level-zero-loader \
+        cmake ninja python curl git pciutils ;;
+    debian)
+      # oneAPI from Intel's apt repository; the GPU runtime (Level Zero, ocloc) from the distribution, which
+      # has Battlemage support from Ubuntu 25.04 / Debian 13; on Ubuntu 24.04 from Intel's graphics PPA
+      sudo apt-get update
+      sudo apt-get install -y ca-certificates curl gpg git cmake ninja-build python3 python3-venv pciutils
+      if [ ! -f /etc/apt/sources.list.d/oneAPI.list ]; then
+        curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB |
+          gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg >/dev/null
+        echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" |
+          sudo tee /etc/apt/sources.list.d/oneAPI.list >/dev/null
+      fi
+      local ver; ver=$(. /etc/os-release; echo "${ID:-}:${VERSION_ID:-}")
+      if [ "$ver" = "ubuntu:24.04" ] && ! compgen -G "/etc/apt/sources.list.d/*kobuk*" >/dev/null; then
+        sudo apt-get install -y software-properties-common
+        sudo add-apt-repository -y ppa:kobuk-team/intel-graphics
+      fi
+      sudo apt-get update
+      sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp
+      # GPU runtime: Level Zero loader + Intel's driver + ocloc and the graphics compiler it loads (ocloc does
+      # not depend on libigc2 on every release, so it is listed)
+      local want=(libze1 libze-intel-gpu1 intel-ocloc libigc2 libigdfcl2) have_pkgs=() p
+      for p in "${want[@]}"; do apt-cache show "$p" >/dev/null 2>&1 && have_pkgs+=("$p"); done
+      if [[ " ${have_pkgs[*]} " != *" libze-intel-gpu1 "* ]] || [[ " ${have_pkgs[*]} " != *" intel-ocloc "* ]]; then
+        die "this distribution has no packages for the Intel GPU compute runtime (libze-intel-gpu1, intel-ocloc).
+  Debian 13 does not ship it: install Intel's release packages from https://github.com/intel/compute-runtime/releases
+  (and the matching intel-graphics-compiler), then run install.sh again. Ubuntu 24.04+ works out of the box."
+      fi
+      sudo apt-get install -y "${have_pkgs[@]}" ;;
+    fedora)
+      if [ ! -f /etc/yum.repos.d/oneAPI.repo ]; then
+        sudo tee /etc/yum.repos.d/oneAPI.repo >/dev/null <<'REPO'
+[oneAPI]
+name=Intel oneAPI repository
+baseurl=https://yum.repos.intel.com/oneapi
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+REPO
+      fi
+      sudo dnf install -y intel-oneapi-compiler-dpcpp-cpp intel-compute-runtime oneapi-level-zero intel-ocloc \
+        cmake ninja-build python3 curl git pciutils ;;
+  esac
+}
+
+missing_deps
 if [ ${#missing[@]} -gt 0 ]; then
   warn "missing: ${missing[*]}"
-  if have pacman; then
-    pkgs=(intel-oneapi-dpcpp-cpp intel-compute-runtime level-zero-loader cmake ninja python curl)
-    echo "  On Arch-based systems these come from: sudo pacman -S --needed ${pkgs[*]}"
-    if [ $deps = 1 ] && ask "Install them now with sudo pacman?" y; then
-      sudo pacman -S --needed "${pkgs[@]}"
-    else
-      die "install the packages above and run install.sh again"
-    fi
-  else
+  if [ $distro = other ]; then
     cat <<EOF
-  This installer installs packages only on Arch-based systems. Elsewhere, install:
-    - Intel oneAPI DPC++/C++ compiler 2025.1 or newer (icpx), from Intel's oneAPI repository
+  Unknown distribution: install these yourself, then run install.sh again:
+    - Intel oneAPI DPC++/C++ compiler 2025.1 or newer (icpx):
       https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compiler-download.html
-    - the Intel GPU compute runtime with Level Zero and ocloc (Ubuntu: libze1 libze-intel-gpu1 intel-ocloc,
-      Fedora: intel-compute-runtime oneapi-level-zero intel-ocloc)
-    - cmake, python3 with venv, curl
-  then run install.sh again. (Only Arch has been tested.)
+    - the Intel GPU compute runtime with Level Zero and ocloc
+    - cmake, python3 with venv, curl, git
 EOF
     exit 1
   fi
+  [ $deps = 1 ] || die "install them and run install.sh again (--no-deps was given)"
+  echo "  ArcAngel can install them with your package manager ($distro; uses sudo, adds Intel's oneAPI repository"
+  echo "  on Debian/Ubuntu/Fedora)."
+  ask "Install them now?" y || die "install them and run install.sh again"
+  install_deps
+  ldcache=$( { ldconfig -p || /sbin/ldconfig -p; } 2>/dev/null || true)
+  missing_deps
+  [ ${#missing[@]} -eq 0 ] || die "still missing after installing: ${missing[*]}"
 fi
 [ -f "$ONEAPI_ROOT/setvars.sh" ] || die "no $ONEAPI_ROOT/setvars.sh: set ONEAPI_ROOT to your oneAPI install"
-ok "compiler, GPU runtime, cmake, python"
-rnode=$(ls /dev/dri/renderD* 2>/dev/null | head -1 || true)
-if [ -z "$rnode" ]; then
-  warn "no /dev/dri/renderD* device: is the GPU driver (xe or i915) loaded?"
-elif ! [ -r "$rnode" ] || ! [ -w "$rnode" ]; then
-  warn "no access to $rnode: add yourself to the 'render' group (sudo usermod -aG render \$USER) and log in again"
+set +u
+# shellcheck disable=SC1091
+source "$ONEAPI_ROOT/setvars.sh" --force >/dev/null 2>&1 || true
+set -u
+have icpx || die "icpx not found after sourcing $ONEAPI_ROOT/setvars.sh"
+
+# versions: oneAPI 2025.1+ (Battlemage AOT, the joint_matrix API used here), Linux 6.12+ (xe driver for Battlemage)
+icpx_ver=$(icpx --version 2>/dev/null | sed -n 's/.*Compiler \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
+if [ -n "$icpx_ver" ] && ! printf '%s\n%s\n' 2025.1 "$icpx_ver" | sort -V -C; then
+  die "oneAPI compiler $icpx_ver is too old: ArcAngel needs 2025.1 or newer"
+fi
+ok "oneAPI compiler ${icpx_ver:-?}, ocloc, Level Zero, cmake, python"
+
+if [ $build_only = 0 ]; then
+  kver=$(uname -r | sed 's/[^0-9.].*//')
+  if ! printf '%s\n%s\n' 6.12 "$kver" | sort -V -C; then
+    warn "Linux $kver: Battlemage needs 6.12 or newer for full support (xe driver); update the kernel if the GPU is not found"
+  fi
+  # the Intel GPU's kernel driver
+  if have lspci; then
+    for dev in $(lspci -Dn 2>/dev/null | awk '$2 ~ /^03/ && $3 ~ /^8086:/ {print $1}'); do
+      drv=$(basename "$(readlink -f "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null || true)
+      case $drv in
+        xe|i915) ;;
+        "") warn "no kernel driver bound to the Intel GPU at $dev: needs Linux 6.12+ with the xe driver and GPU firmware (linux-firmware)" ;;
+        *) warn "the Intel GPU at $dev uses the '$drv' driver; ArcAngel needs xe (or i915)" ;;
+      esac
+    done
+  fi
+  rnode=$(ls /dev/dri/renderD* 2>/dev/null | head -1 || true)
+  if [ -z "$rnode" ]; then
+    die "no /dev/dri/renderD* device: the GPU driver is not loaded (needs Linux 6.12+ with the xe driver and linux-firmware)"
+  elif ! [ -r "$rnode" ] || ! [ -w "$rnode" ]; then
+    die "no access to $rnode: add yourself to the 'render' group (sudo usermod -aG render \$USER) and log in again"
+  fi
+  # the compute runtime must see the card before anything big is downloaded
+  if have sycl-ls; then
+    l0=$(sycl-ls 2>/dev/null | grep '^\[level_zero:gpu\]' || true)
+    if [ -z "$l0" ]; then
+      die "the GPU is not visible to Level Zero (sycl-ls lists no level_zero:gpu): the compute runtime (intel-compute-runtime / libze-intel-gpu1) is missing or too old for Battlemage"
+    fi
+    echo "$l0" | sed 's/^\[level_zero:gpu\]\[level_zero:[0-9]*\] Intel(R) oneAPI Unified Runtime over Level-Zero[^,]*, /  gpu: /'
+  fi
 fi
 
 # ------------------------------------------------------------------------------------------------------
+if [ $build_only = 0 ]; then
 step "3/6 Python environment and model"
 
 venv=$REPO/server/.venv
 if [ ! -x "$venv/bin/python" ]; then
   python3 -m venv "$venv"
 fi
-"$venv/bin/pip" install -q --disable-pip-version-check -r "$REPO/server/requirements.txt"
+# a venv made by another tool (uv) may have no pip: add it
+if ! "$venv/bin/python" -m pip --version >/dev/null 2>&1 && ! "$venv/bin/python" -m ensurepip -q >/dev/null 2>&1; then
+  rm -rf "$venv" && python3 -m venv "$venv"  # ArcAngel's own environment: rebuild it with pip
+fi
+"$venv/bin/python" -m pip install -q --disable-pip-version-check -r "$REPO/server/requirements.txt"
 ok "server environment ($venv)"
 
 assets=$DATA/assets
@@ -246,14 +357,11 @@ else
   ok "$model"
 fi
 
+fi  # build_only
+
 # ------------------------------------------------------------------------------------------------------
 step "4/6 Build (kernels compiled ahead of time for $chip; takes a few minutes)"
 
-set +u
-# shellcheck disable=SC1091
-source "$ONEAPI_ROOT/setvars.sh" --force >/dev/null 2>&1 || true
-set -u
-have icpx || die "icpx not found after sourcing $ONEAPI_ROOT/setvars.sh"
 gen=(); have ninja && gen=(-G Ninja)
 build=$REPO/build
 if [ -f "$build/CMakeCache.txt" ] && ! grep -q "^INK_AOT_TARGETS:STRING=$chip\$" "$build/CMakeCache.txt"; then
@@ -265,6 +373,10 @@ cmake --build "$build" --target inkling ink-probe bench-decode bench-prefill tes
   grep -Ev '^\[|^ninja: |^Build succeeded|^Compilation from IR|^$' || true
 [ -f "$build/libinkling.so" ] || die "build failed (run: cmake --build $build)"
 ok "$build/libinkling.so"
+if [ $build_only = 1 ]; then
+  echo; echo "${B}Built.${N} (--build-only: no model, service or opencode set up)"
+  exit 0
+fi
 
 # check the formats and the card's memory against the model (reads the header, moves ~64 MiB through the GPU)
 export LD_LIBRARY_PATH=$ONEAPI_ROOT/compiler/latest/lib:$ONEAPI_ROOT/tbb/latest/lib:$ONEAPI_ROOT/umf/latest/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
@@ -365,7 +477,7 @@ EOF
     fi
   fi
 else
-  echo "  skipped (opencode not found); any OpenAI-compatible client can use http://127.0.0.1:$port/v1"
+  echo "  skipped; any OpenAI-compatible client can use http://127.0.0.1:$port/v1"
 fi
 
 # ------------------------------------------------------------------------------------------------------
