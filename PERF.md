@@ -142,7 +142,9 @@ edits and little on new text.
   memcpy); with vm.swappiness 150 the model file's page cache made the kernel swap the experts out, so the
   GPU's reads stalled (prompt reading > 5 min for 4k tokens): the loader drops copied file pages when
   offloading; a Q8_0 embedding was repacked but read in the file layout (garbage, then a GPU hang).
-- Prompt reading: 368-385 tok/s at 4k (the GPU reads each chunk's offloaded experts over PCIe).
+- Prompt reading: the GPU read each chunk's offloaded experts over PCIe (8.6 GB/s): 368-385 tok/s at 4k. Now
+  each offloaded expert tensor is copied into the cache's VRAM by the copy engine (14.1 GB/s) before its
+  kernel: 470 tok/s at 4k, 452 at 16k; the cache is refilled after the prompt (~60 ms).
 
 ## KV cache
 

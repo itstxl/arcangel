@@ -968,12 +968,22 @@ FastEngine::FastEngine(sycl::queue & q, const Model & m, int n_ctx, bool use_gra
         cache_slots_ = per_slot ? (int) std::min<size_t>(h.n_expert, budget / per_slot) : 0;
         ecache_.resize(h.n_layer);
         if (cache_slots_ > 0) {
+            // one allocation, also the prompt path's staging area for offloaded expert tensors
+            stage_bytes_ = (size_t) cache_slots_ * per_slot + 6 * 256 * (size_t) h.n_layer;  // + 256-byte alignment of each plane
+            stage_pool_ = dev<uint8_t>(stage_bytes_);
+            size_t used = 0;
+            auto carve = [&](size_t n) {
+                uint8_t * q = stage_pool_ + used;
+                used += (n + 255) / 256 * 256;
+                if (used > stage_bytes_) throw std::runtime_error("expert cache: pool layout");
+                return q;
+            };
             auto alloc_like = [&](const W & src, int rows_e) {
                 W w = src;
                 const size_t rows = (size_t) cache_slots_ * rows_e;
-                w.p = dev<uint8_t>(rows * src.row_bytes);
-                w.aux = src.aux ? dev<uint8_t>(rows * src.aux_row_bytes) : nullptr;
-                w.aux2 = src.aux2 ? dev<uint8_t>(rows * src.aux2_row_bytes) : nullptr;
+                w.p = carve(rows * src.row_bytes);
+                w.aux = src.aux ? carve(rows * src.aux_row_bytes) : nullptr;
+                w.aux2 = src.aux2 ? carve(rows * src.aux2_row_bytes) : nullptr;
                 w.ne[2] = cache_slots_;
                 return w;
             };
@@ -1013,6 +1023,15 @@ void FastEngine::split(int ip) {
 }
 
 // ends the cached-experts segment: step() submits it right after the CPU-expert split, before the CPU starts
+void FastEngine::reload_cache() {
+    if (!staged_) return;
+    staged_ = false;
+    for (ExpertCache & c : ecache_) std::fill(c.slot_e.begin(), c.slot_e.end(), -1);
+    // refresh_cache decays the counts: undo that for a reload
+    for (ExpertCache & c : ecache_) for (double & v : c.count) v /= 0.7;
+    refresh_cache();
+}
+
 void FastEngine::split_cache() {
     if (jobs_only_ || !rec_) return;
     rec_->end_recording(q_);

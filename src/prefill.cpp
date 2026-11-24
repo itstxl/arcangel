@@ -1067,7 +1067,7 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
     static const int gx_dbg = getenv("INK_EXP_SKIP") ? atoi(getenv("INK_EXP_SKIP")) : 0;  // 1: skip decode, 2: skip XMX  // A/B switch for the transposed expert kernel
     if (use_xmx) {
         // gate-up on XMX into a scratch [pair][2 n_ff], then SITU; down on XMX weighted per pair; per-token sum
-        const W & wg = L.gate_up;
+        const W wg = stage(L.gate_up, v.ip);  // offloaded: streamed to VRAM by the copy engine first
         const int nff = h.n_ff, nu = h.n_used;
         if ((int) wg.ne[1] != 2 * nff || nff % (GR / 2)) throw std::runtime_error("prefill: gate-up shape does not fit the fused kernel");
         GxOut og;
@@ -1079,7 +1079,7 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
             P("b_gate_up", k_gxmm<decltype(tag)::value, GX_SITU, float>(q_, wref(wg), (int) wg.ne[0], (int) wg.ne[1], bf_, D, nu, bpairs_, btiles_,
                                                                         max_tiles, L.gate_up_s.ok() ? L.gate_up_s.f32() : nullptr, nullptr, og, gx_dbg));
         });
-        const W & wd = L.down;
+        const W wd = stage(L.down, v.ip);
         GxOut od;
         od.y = bo_;
         od.ys = D;
@@ -1096,7 +1096,7 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
 
     // experts: gate-up with SITU for every pair, grouped by expert
     {
-        const W & w = L.gate_up;
+        const W w = stage(L.gate_up, v.ip);
         const WRef wr = wref(w);
         const int cols = (int) w.ne[0], rows_e = (int) w.ne[1], nff = h.n_ff, nu = h.n_used;
         const float * f = bf_, * gs = L.gate_up_s.ok() ? L.gate_up_s.f32() : nullptr;
@@ -1144,7 +1144,7 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
 
     // experts: down for every pair (weighted), then the per-token sum
     {
-        const W & w = L.down;
+        const W w = stage(L.down, v.ip);
         const WRef wr = wref(w);
         const int cols = (int) w.ne[0], nu = h.n_used;
         const sycl::half * act = bact_;
@@ -1187,6 +1187,30 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
     }
     P("b_conv", k_bconv_res(q_, bo_, L.ffn_post_conv.f32(), hist_[v.slot] + (size_t) (2 * kvw + D) * 3, bxb_, bxa_, false, n));
     bhist("b_conv", bo_, D, v.slot, 2 * kvw + D, D, n);
+}
+
+// Prompt path, offloaded layer: copy the whole expert tensor into VRAM with the copy engine (14 GB/s on a
+// B580 against ~8.6 GB/s for kernels reading pinned RAM directly), into the hot-expert cache's memory, which
+// is refilled after the prompt. Falls back to reading RAM when the tensor does not fit.
+W FastEngine::stage(const W & w, int ip) {
+    if (ip >= (int) m_.offloaded.size() || !m_.offloaded[ip] || !stage_pool_) return w;
+    const size_t rows = (size_t) w.ne[1] * w.ne[2];
+    const size_t b0 = rows * w.row_bytes, b1 = w.aux ? rows * w.aux_row_bytes : 0, b2 = w.aux2 ? rows * w.aux2_row_bytes : 0;
+    if (b0 + b1 + b2 > stage_bytes_) return w;
+    W s = w;
+    uint8_t * d = stage_pool_;
+    P("b_stage", q_.memcpy(d, w.p, b0));
+    s.p = d;
+    if (b1) {
+        P("b_stage", q_.memcpy(d + b0, w.aux, b1));
+        s.aux = d + b0;
+    }
+    if (b2) {
+        P("b_stage", q_.memcpy(d + b0 + b1, w.aux2, b2));
+        s.aux2 = d + b0 + b1;
+    }
+    staged_ = true;
+    return s;
 }
 
 void FastEngine::embed(int n) {
@@ -1276,6 +1300,7 @@ const std::vector<float> & FastEngine::verify(const std::vector<int> & tokens, i
         throw;
     }
     verify_ = false;
+    reload_cache();
     vlogits_host_.resize((size_t) n * h.n_vocab);
     q_.memcpy(vlogits_host_.data(), vlogits_, vlogits_host_.size() * sizeof(float)).wait();
     if (h.softcap > 0.0f)
@@ -1345,6 +1370,7 @@ const std::vector<float> & FastEngine::prefill(const std::vector<int> & tokens, 
     q_.memcpy(logits_.data(), logits_dev_, h.n_vocab * sizeof(float)).wait();
     if (h.softcap > 0.0f)
         for (float & v : logits_) v = h.softcap * std::tanh(v / h.softcap);
+    reload_cache();
     if (profile && !prof_events_.empty()) {
         for (auto & [label, e] : prof_events_) {
             const double ms = (e.get_profiling_info<sycl::info::event_profiling::command_end>() -

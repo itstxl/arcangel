@@ -172,6 +172,11 @@ private:
     float * ygpu_ = nullptr;         // device [D]: the cached experts' sum
     std::vector<char> seg_cache_;    // per graph segment: 1 = the cached-experts segment (runs during the CPU)
     void split_cache();
+    W stage(const W & w, int ip);   // prompt path: offloaded expert tensor streamed into stage_pool_
+    void reload_cache();            // after staging overwrote the cache: copy its experts back
+    uint8_t * stage_pool_ = nullptr;  // = the hot-expert cache's memory (one allocation)
+    size_t stage_bytes_ = 0;
+    bool staged_ = false;
     void refresh_cache();
     int tokens_since_refresh_ = 0;
     bool cache_warm_ = false;
