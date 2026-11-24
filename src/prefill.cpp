@@ -693,6 +693,8 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
             sycl::local_accessor<sycl::half, 1> sP(rows * KT, cgh);
             sycl::local_accessor<float, 1> sR(rows * 16, cgh);
             sycl::local_accessor<float, 1> sM(rows, cgh), sL(rows, cgh), sA(rows, cgh);
+            // the relative-position bias rows this K tile needs: distances [dlo, dlo + QB + KT - 1)
+            sycl::local_accessor<float, 1> sRB((QB + KT) * 16, cgh);
             cgh.parallel_for(sycl::nd_range<1>((size_t) nkv * nqb * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
                 namespace xi = sycl::ext::intel::experimental::matrix;
                 const auto grp = it.get_group();
@@ -759,6 +761,15 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
                         }
                         *(sycl::vec<sycl::half, 8> *) &sKV[HD * KT + j * HD + d8] = vv;
                     }
+                    // bias rows for this tile's distances, coalesced into local memory once (the softmax step read
+                    // them from global memory per (row, key): profiled as the kernel's main stall)
+                    const int dlo = sycl::max(0, pfirst - (kt + KT - 1));
+                    const bool bias = dlo < extent;
+                    if (bias)
+                        for (int i = t; i < (QB + KT) * 16; i += WG) {
+                            const int dist = dlo + i / 16, e = i % 16;
+                            sRB[i] = dist < extent && e < n_rel ? rb[e + n_rel * dist] : 0.0f;
+                        }
                     sycl::group_barrier(grp);
                     if (qk) {  // S tile (qm, qn): 8 rows x 16 keys
                         xmx::joint_matrix<sycl::sub_group, float, xmx::use::accumulator, 8, 16> sc;
@@ -782,7 +793,7 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
                                 sx = sS[r * KT + j];
                                 const int dist = p - k;
                                 if (dist < extent)
-                                    for (int e = 0; e < n_rel; ++e) sx += rb[e + n_rel * dist] * sR[r * 16 + e];
+                                    for (int e = 0; e < n_rel; ++e) sx += sRB[(dist - dlo) * 16 + e] * sR[r * 16 + e];
                             }
                             sv[e2] = sx;
                         }
