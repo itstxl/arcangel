@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -49,6 +50,10 @@ public:
     // after every one of them ([n][vocab]). The K/V cache is written for all n; the convolution history is not
     // advanced until commit(keep), which keeps the first `keep` tokens (decoding then continues at pos0 + keep;
     // the cache entries past it are overwritten later).
+    // Early exit (self-drafting measurement): the logits after `token` at `pos` with only `n_pass` loop passes
+    // (prelude, n_pass passes, coda). Leaves the state as it was: the convolution history is restored, and the
+    // cache entries it wrote at `pos` are overwritten by the full step(token, pos) that follows.
+    const std::vector<float> & draft(int token, int pos, int n_pass);
     static constexpr int VMAX = 16;
     const std::vector<float> & verify(const std::vector<int> & tokens, int pos0);
     void commit(int keep);
@@ -141,6 +146,9 @@ private:
     std::vector<MvJob *> job_cache_;
     size_t job_next_ = 0;
     bool jobs_only_ = false;
+    const Schedule * sched_ = nullptr;  // the schedule record() follows (default: the model's)
+    std::map<int, std::pair<Schedule, std::vector<MvJob *>>> drafts_;  // n_pass -> schedule, its job tables
+    float * hsave_ = nullptr;           // convolution histories saved around a draft
     float * router_logits_ = nullptr;
 
     using ExecGraph = sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>;

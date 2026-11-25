@@ -171,6 +171,24 @@ needs a batched decode path: per-token buffers and positions, sequential convolu
 kernels grouped by expert (shared experts read once), a batched CPU-expert path, a graph per batch size, and
 the drafting / acceptance loop in the server.
 
+### Early-exit self-drafting (2026-11-25, after 2DSD)
+
+2DSD (Kim et al. 2026, "Two-Dimensional Speculative Decoding for Looped Language Models") drafts with a
+looped model's own early loop passes plus a trained drafter, and reports 4-5x on Ouro on an H100. Its trained
+parts (drafter, shared-KV fine-tune) do not exist for Inkling. The untrained part was measured
+(`FastEngine::draft` / `ink_draft`, `bench/early_exit.py`; 6 traced opencode requests, 1.5k tokens):
+
+| Draft | top-1 = full model | acceptance (sampling, p_full of the draft) |
+|---|---|---|
+| prelude + 1 of 3 loop passes + coda (24 of 48 visits) | 61-75% (75% overall) | 72% |
+| prelude + 2 passes + coda (36 visits) | 68-77% (76%) | 72% |
+
+High for a model never trained to exit early, and a second pass adds almost nothing. But with this MoE's
+batch costs (shared experts only, see above) a draft-then-verify cycle barely pays: full VRAM 1.18x at best
+(one draft token, verify reusing the draft's prelude and first pass), offload 1.0x (the CPU-expert layers are
+all in the prelude and coda, so the draft carries their full cost). Plain verify is slower in both setups.
+Not built.
+
 ## Offload setup (2026-11-24, UD-Q4_K_XL on the B580)
 
 - Placement: the 12 single-pass layers' experts (8.3 GiB) in pinned RAM: half of the expert bytes, a quarter

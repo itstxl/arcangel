@@ -72,6 +72,8 @@ struct Schedule {
     int prelude_end = 0;          // visits before this index are the prelude; save x after them
 };
 
+Schedule make_schedule(const Hparams & h);  // n_pass < the model's: an early exit after that many loop passes
+
 class Model {
 public:
     // repack: store some formats in kernel-friendly layouts (the fast engine); the reference engine needs false

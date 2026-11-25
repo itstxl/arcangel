@@ -232,7 +232,7 @@ W load(sycl::queue & q, const GgufFile & f, const std::string & name, bool requi
     return w;
 }
 
-Schedule make_schedule(const Hparams & h) {
+Schedule make_schedule_impl(const Hparams & h) {
     Schedule s;
     int next = 0;
     std::vector<int> blocks;
@@ -275,6 +275,8 @@ Schedule make_schedule(const Hparams & h) {
 }
 
 }  // namespace
+
+Schedule make_schedule(const Hparams & h) { return make_schedule_impl(h); }
 
 void Model::check_fits(sycl::queue & q, uint64_t need, const std::string & what) {
     const DeviceInfo d = describe(q.get_device());

@@ -1788,10 +1788,11 @@ void FastEngine::record() {
                 for (int j = 0; j < 32; ++j) x[t * 32 + j] = v[j] * r * nw[t * 32 + j];
         }));
     }
-    const auto & vs = m_.schedule.visits;
+    const Schedule & sch = sched_ ? *sched_ : m_.schedule;
+    const auto & vs = sch.visits;
     for (size_t i = 0; i < vs.size(); ++i) {
         visit(vs[i]);
-        if (run && (int) i + 1 == m_.schedule.prelude_end) P("prelude", q_.memcpy(prelude_, xa_, D * sizeof(float)));
+        if (run && (int) i + 1 == sch.prelude_end) P("prelude", q_.memcpy(prelude_, xa_, D * sizeof(float)));
         if (run && graphs_.empty() && hook) hook("l_out-" + std::to_string(vs[i].slot), xa_, D);
     }
     // output: depth mix with the final blocks, norm, LM head with softcap
@@ -1799,8 +1800,8 @@ void FastEngine::record() {
     const std::vector<MvGroup> head = plan_mv({MvJob{wref(o), o.ktype, (int) o.ne[0], (int) o.ne[1], 0, 1 << 30, f_, f_, logits_dev_, h.softcap}});
     if (!run) return;
     MixArgs a;
-    for (size_t s = 0; s < m_.schedule.out_blocks.size(); ++s) a.st[s] = store_ + (size_t) m_.schedule.out_blocks[s] * D;
-    a.ns = (int) m_.schedule.out_blocks.size();
+    for (size_t s = 0; s < sch.out_blocks.size(); ++s) a.st[s] = store_ + (size_t) sch.out_blocks[s] * D;
+    a.ns = (int) sch.out_blocks.size();
     a.cur = xa_;
     a.qw = m_.output_res_query.f32();
     a.nq = 1;
@@ -1809,6 +1810,39 @@ void FastEngine::record() {
     a.normw[0] = m_.output_norm.f32();
     P("out_mix", k_mix(q_, a));
     run_mv("head", head);
+}
+
+const std::vector<float> & FastEngine::draft(int token, int pos, int n_pass) {
+    const Hparams & h = hp_;
+    if (n_pass < 1 || n_pass > h.n_pass) throw std::runtime_error("draft: n_pass out of range");
+    if (cpu_) throw std::runtime_error("draft: not with expert offloading");
+    const size_t hn = (size_t) h.conv_channels() * 3;
+    if (!hsave_) hsave_ = dev<float>((size_t) h.n_slot() * hn);
+    auto & d = drafts_[n_pass];
+    if (d.first.visits.empty()) {
+        Hparams hp = h;
+        hp.n_pass = n_pass;
+        d.first = make_schedule(hp);
+    }
+    for (int s = 0; s < h.n_slot(); ++s) q_.memcpy(hsave_ + s * hn, hist_[s], hn * sizeof(float));
+    // the draft schedule's own job tables (record() hands them out in visit order)
+    std::swap(job_cache_, d.second);
+    sched_ = &d.first;
+    if (job_cache_.empty()) {
+        jobs_only_ = true;
+        record();
+        jobs_only_ = false;
+    }
+    q_.memcpy(token_, &token, sizeof(int32_t));
+    q_.memcpy(pos_, &pos, sizeof(int32_t));
+    record();  // submitted directly
+    sched_ = nullptr;
+    std::swap(job_cache_, d.second);
+    logits_.resize(h.n_vocab);
+    q_.memcpy(logits_.data(), logits_dev_, h.n_vocab * sizeof(float)).wait();
+    for (int s = 0; s < h.n_slot(); ++s) q_.memcpy(hist_[s], hsave_ + s * hn, hn * sizeof(float));
+    q_.wait();
+    return logits_;
 }
 
 const std::vector<float> & FastEngine::step(int token, int pos) {

@@ -80,6 +80,15 @@ int ink_verify(void * hp, const int32_t * toks, int n, int pos0, float * logits)
     });
 }
 
+// Early-exit logits (n_pass loop passes) for the token at pos, state left unchanged; then call ink_step.
+int ink_draft(void * hp, int32_t token, int pos, int n_pass, float * logits) {
+    return guarded([&] {
+        const auto & l = ((Handle *) hp)->eng->draft(token, pos, n_pass);
+        if (logits) std::memcpy(logits, l.data(), l.size() * sizeof(float));
+        return 0;
+    });
+}
+
 int ink_commit(void * hp, int keep) {
     return guarded([&] {
         ((Handle *) hp)->eng->commit(keep);
