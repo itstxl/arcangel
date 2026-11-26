@@ -382,6 +382,18 @@ INK_KV=4 build/test-verify $M 2000 8192      # batched verification vs one-at-a-
 build/test-dspark $M path/to/dspark.gguf     # DSpark draft engine checks
 ```
 
+For a 128k coding-agent workload, use a fixed text corpus of source files and tool output with at least 130,176
+tokens (`bench/code_context.py` needs `tokenizers`; pass `--tokenizer` if `server/tokenizer.json` is not present):
+
+```
+python3 bench/code_context.py path/to/Inkling-2-Mini-UD-Q4_K_XL.gguf path/to/code-corpus.txt --runs 3
+```
+
+It runs full VRAM with 8-bit KV and reports, in tok/s, cold prompt reading, a 1,024-token uncached append to a
+129,024-token prefix (an agent reusing a long prefix), and 128 graph decode steps against the populated cache. Decode
+feeds fixed continuation tokens from the corpus, so different builds do the same work. Compare median rates with the
+same model, corpus hash, tokenizer and prompt chunk size.
+
 The correctness tests compare with llama.cpp on the CPU, so they need a llama.cpp build with Inkling 2
 support. Configure with `-DINK_LLAMA_TESTS=ON -DINK_LLAMA_DIR=path/to/llama.cpp`, then:
 
