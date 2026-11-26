@@ -124,34 +124,34 @@ Why these models:
 
 ## Run with Docker
 
-Use Docker with BuildKit on an x86-64 Linux host with an Intel Arc Battlemage GPU, the `xe` driver, and GPU firmware (Linux 6.12 or later).
+Use Docker with BuildKit and the Docker Compose plugin on an x86-64 Linux host with an Intel Arc Battlemage GPU, the `xe` driver, and GPU firmware (Linux 6.12 or later).
 The image includes the userspace GPU runtime and checksum-verified tokenizer and chat template, so you don't need to run `install.sh` on the host.
 Download the GGUF for your card from [the model repository](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) separately and use a copy you trust.
 
-These commands use the B580 full-VRAM profile.
-Set `render_node` to the render device for your Arc card; on a multi-GPU host, check `/dev/dri/by-path/` for the mapping.
+Create `.env` from the template and fill in your user ID, group ID, and render device's group ID automatically:
 
 ```fish
-docker build --platform linux/amd64 -t arcangel .
-set render_node /dev/dri/renderD128
-set model (realpath ~/models/Inkling-2-Mini-UD-Q2_K_XL.gguf)
-docker run --rm \
-    --device "$render_node:$render_node:rw" \
-    --user (id -u):(id -g) --group-add (stat -c '%g' "$render_node") \
-    --cap-drop ALL --security-opt no-new-privileges=true \
-    --mount "type=bind,source=$model,target=/models/inkling.gguf,readonly" \
-    --publish 127.0.0.1:8082:8082 \
-    arcangel --model /models/inkling.gguf --n-ctx 98304 --kv-bits 4
+make .env
 ```
 
-The image defaults to `bmg_g21` (B570, B580, Pro B50 and Pro B60).
-For a Pro B70, add `--build-arg INK_AOT_TARGETS=bmg_g31` to `docker build`.
-For the offload recipe, pass `--env INK_OFFLOAD=<layers>` to `docker run`, using the layer ranges and matching GGUF from [cards.tsv](cards.tsv).
-If startup reports insufficient VRAM, lower `--n-ctx` or stop other GPU workloads.
+On a multi-GPU host, check `/dev/dri/by-path/` to identify your Arc card's render device and pass it to the setup command, for example `make .env RENDER_NODE=/dev/dri/renderD129`.
+If you already have a `compose.env` from an older checkout, rename it to `.env` to keep your settings.
+If `.env` already exists, edit it directly; the setup command won't overwrite it.
 
+The default is the B580 full-VRAM profile, with `~/models/Inkling-2-Mini-UD-Q2_K_XL.gguf` and `/dev/dri/renderD128`.
+Set `MODEL` to a filename relative to `MODELS_DIR`, and set `N_CTX` and `KV_BITS` to match your profile in [cards.tsv](cards.tsv).
+The image defaults to `bmg_g21` (B570, B580, Pro B50 and Pro B60); for a Pro B70, set `INK_AOT_TARGETS=bmg_g31` in `.env`.
+For offload, set `INK_OFFLOAD` to the layer ranges for your GGUF and profile; the template shows the B60 offload settings.
+
+```fish
+docker compose run --rm --build --service-ports arcangel
+```
+
+Compose loads `.env` automatically, builds the image, and starts the server in the foreground with your models directory mounted read-only at `/models`.
 Once the model is loaded, check `curl -fsS http://127.0.0.1:8082/health`.
-The server listens on all interfaces **inside the container** so Docker can forward traffic, but the example publishes only to host loopback.
-Keep it that way for local use: the API does not authenticate requests.
+If startup reports insufficient VRAM, lower `N_CTX` or stop other GPU workloads.
+Keep `HOST` unset or set to `127.0.0.1` for local use: the API does not authenticate requests.
+An exported shell variable takes precedence over the value in `.env`.
 
 ### Probe and benchmark in Docker
 
@@ -159,7 +159,7 @@ Build the optional `diagnostics` image to run `ink-probe`, `bench-decode`, and `
 The default image does not build or ship these tools.
 
 ```fish
-docker build --platform linux/amd64 --target diagnostics -t arcangel:diagnostics .
+docker build --target diagnostics -t arcangel:diagnostics .
 ```
 
 When running this image, use `--entrypoint /opt/arcangel/build/ink-probe` to probe the GPU instead of starting the server.
