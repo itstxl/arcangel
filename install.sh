@@ -26,7 +26,6 @@ GGUF_REPO=unsloth/Inkling-2-Mini-GGUF
 BASE_REPO=thinkingmachines/Inkling-2-Mini
 # sha256 of the assets the server was validated with (both Apache-2.0, from $BASE_REPO)
 TOKENIZER_SHA=7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6
-TEMPLATE_SHA=53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc
 
 setup="" card="" model="" port=8082 ctx="" kv="" yes=0 deps=1 build_only=0 service=1 opencode=1 start=1 models_dir="$DATA/models"
 
@@ -391,7 +390,7 @@ fetch_asset() {  # NAME SHA
   mv "$f.part" "$f"
 }
 fetch_asset tokenizer.json $TOKENIZER_SHA
-fetch_asset chat_template.jinja $TEMPLATE_SHA
+fetch_asset chat_template.jinja "$(<"$REPO/server/chat_template.sha256")"
 ok "tokenizer and chat template ($assets)"
 
 if [ -z "$model" ]; then
