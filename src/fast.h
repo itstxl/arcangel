@@ -40,6 +40,7 @@ public:
     FastEngine & operator=(const FastEngine &) = delete;
 
     const std::vector<float> & step(int token, int pos);
+    int step_argmax(int token, int pos);
 
     // The prompt: tokens at positions pos0, pos0 + 1, ... processed in chunks of up to prefill_chunk() tokens.
     // Returns the logits after the last token; decoding continues with step(next, pos0 + tokens.size()).
@@ -101,6 +102,7 @@ public:
 
 private:
     void record();            // submit one whole token's kernels to q_
+    void run_step(int token, int pos);  // execute one decode step into logits_dev_
     void prepare_jobs();      // build every job table once, submitting nothing
     void build_graph();       // record one token as a command graph
     void visit(const Visit & v);
@@ -150,6 +152,8 @@ private:
     std::map<int, std::pair<Schedule, std::vector<MvJob *>>> drafts_;  // n_pass -> schedule, its job tables
     float * hsave_ = nullptr;           // convolution histories saved around a draft
     float * router_logits_ = nullptr;
+    float * argmax_val_ = nullptr;
+    int32_t * argmax_idx_ = nullptr;
 
     using ExecGraph = sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>;
     using ModGraph = sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::modifiable>;

@@ -791,6 +791,72 @@ template <uint32_t T> sycl::event k_down_q8(sycl::queue & q, const DownQ8Args a8
     });
 }
 
+// Argmax over a work-group's (val, idx) pairs using sub-group XOR shuffles + SLM across RPG sub-groups.
+inline void wg_argmax(const sycl::nd_item<1> & it, float * sv, int32_t * si, float & bv, int32_t & bi) {
+    const auto sg = it.get_sub_group();
+    const int sgid = (int) sg.get_group_id()[0], lane = (int) sg.get_local_id()[0];
+    for (int off = SG / 2; off > 0; off /= 2) {
+        const float ov = sycl::permute_group_by_xor(sg, bv, off);
+        const int32_t oi = sycl::permute_group_by_xor(sg, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    if (lane == 0) {
+        sv[sgid] = bv;
+        si[sgid] = bi;
+    }
+    sycl::group_barrier(it.get_group());
+    if (sgid == 0) {
+        bv = lane < RPG ? sv[lane] : -INFINITY;
+        bi = lane < RPG ? si[lane] : (1 << 30);
+        for (int off = SG / 2; off > 0; off /= 2) {
+            const float ov = sycl::permute_group_by_xor(sg, bv, off);
+            const int32_t oi = sycl::permute_group_by_xor(sg, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+    }
+}
+
+void k_argmax(sycl::queue & q, const float * x, int n, float * tmp_v, int32_t * tmp_i) {
+    constexpr int NG = WG;  // 256 groups -> 256 partial maxima -> 1 final group of 256
+    q.submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sv(RPG, cgh);
+        sycl::local_accessor<int32_t, 1> si(RPG, cgh);
+        cgh.parallel_for(sycl::nd_range<1>((size_t) NG * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            float bv = -INFINITY;
+            int32_t bi = 1 << 30;
+            for (int i = (int) it.get_global_id(0); i < n; i += NG * WG) {
+                const float v = x[i];
+                if (v > bv || (v == bv && i < bi)) {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            wg_argmax(it, &sv[0], &si[0], bv, bi);
+            if (it.get_local_id(0) == 0) {
+                tmp_v[it.get_group(0)] = bv;
+                tmp_i[it.get_group(0)] = bi;
+            }
+        });
+    });
+    q.submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sv(RPG, cgh);
+        sycl::local_accessor<int32_t, 1> si(RPG, cgh);
+        cgh.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int l = (int) it.get_local_id(0);
+            float bv = tmp_v[l];
+            int32_t bi = tmp_i[l];
+            wg_argmax(it, &sv[0], &si[0], bv, bi);
+            if (l == 0) tmp_i[0] = bi;
+        });
+    });
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------
@@ -987,6 +1053,8 @@ FastEngine::FastEngine(sycl::queue & q, const Model & m, int n_ctx, bool use_gra
     blogits_ = dev<float>((size_t) TB_ * 256);
     bwts_ = dev<float>((size_t) TB_ * h.n_used);
     logits_dev_ = dev<float>((size_t) m.output.ne[1]);
+    argmax_val_ = dev<float>(WG);
+    argmax_idx_ = dev<int32_t>(WG);
     wts_ = dev<float>(64);
     ids_ = dev<int32_t>(64);
     q_.wait();
@@ -1879,7 +1947,7 @@ const std::vector<float> & FastEngine::draft(int token, int pos, int n_pass) {
     return logits_;
 }
 
-const std::vector<float> & FastEngine::step(int token, int pos) {
+void FastEngine::run_step(int token, int pos) {
     if (pos >= n_ctx_) throw std::runtime_error("context is full");
     q_.memcpy(token_, &token, sizeof(int32_t));
     q_.memcpy(pos_, &pos, sizeof(int32_t));
@@ -1915,6 +1983,10 @@ const std::vector<float> & FastEngine::step(int token, int pos) {
     } else {
         record();
     }
+}
+
+const std::vector<float> & FastEngine::step(int token, int pos) {
+    run_step(token, pos);
     logits_.resize(hp_.n_vocab);
     q_.memcpy(logits_.data(), logits_dev_, hp_.n_vocab * sizeof(float)).wait();
     if (profile && !prof_events_.empty()) {
@@ -1929,6 +2001,14 @@ const std::vector<float> & FastEngine::step(int token, int pos) {
         ++prof_tokens_;
     }
     return logits_;
+}
+
+int FastEngine::step_argmax(int token, int pos) {
+    run_step(token, pos);
+    k_argmax(q_, logits_dev_, hp_.n_vocab, argmax_val_, argmax_idx_);
+    int32_t best = 0;
+    q_.memcpy(&best, argmax_idx_, sizeof(int32_t)).wait();
+    return best;
 }
 
 // one slot's cache for tokens [tok0, tok0 + ntok) <-> host bytes laid out K, K scales, V, V scales

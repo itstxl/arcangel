@@ -57,6 +57,8 @@ class Engine:
         f32p = ctypes.POINTER(ctypes.c_float)
         L.ink_prefill.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int, ctypes.c_int, f32p]
         L.ink_step.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int, f32p]
+        L.ink_step_argmax.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int]
+        L.ink_step_argmax.restype = ctypes.c_int
         L.ink_save.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         L.ink_restore.argtypes = [ctypes.c_void_p, ctypes.c_int]
         L.ink_stash.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
@@ -94,6 +96,9 @@ class Engine:
 
     def step(self, tok, pos):
         self.check(self.lib.ink_step(self.h, tok, pos, self.lp))
+
+    def step_argmax(self, tok, pos):
+        return self.check(self.lib.ink_step_argmax(self.h, tok, pos))
 
     # Whole conversations stashed in host RAM (full KV up to their prompt end), so a short unrelated request
     # (opencode's titles and summaries) does not cost the main conversation a full re-read.
@@ -253,23 +258,64 @@ class OutputParser:
         self.mode = None  # None (between blocks), "header", "think", "text", "tool"
         self.block = []   # token ids of the current block's body
         self.sent = ""    # text of the current block already emitted
+        self.anchor_ids = []
+        self.anchor_text = ""
+        self.pending = []
         self.header = []  # token ids of a tool header (the tool's name)
         self.tool_calls = []
         self.events = []  # (kind, value): ("reasoning", str) / ("content", str) / ("tool", dict)
 
+    def _reset_block(self, mode, tok_list=None):
+        self.mode = mode
+        self.block = list(tok_list) if tok_list else []
+        self.sent = ""
+        self.anchor_ids = []
+        self.anchor_text = ""
+        self.pending = list(tok_list) if tok_list else []
+
+    def _set_anchor(self):
+        cand = self.pending[-1:]
+        cand_txt = self.tok.decode(cand, skip_special_tokens=False)
+        if not cand_txt.endswith("\ufffd") and not cand_txt.startswith("\ufffd"):
+            self.anchor_ids, self.anchor_text = cand, cand_txt
+            return
+        cand = (self.anchor_ids + self.pending)[-4:]
+        cand_txt = self.tok.decode(cand, skip_special_tokens=False)
+        if not cand_txt.endswith("\ufffd") and not cand_txt.startswith("\ufffd"):
+            self.anchor_ids, self.anchor_text = cand, cand_txt
+        else:
+            self.anchor_ids, self.anchor_text = [], ""
+
     def _flush(self, final=False):
-        text = self.tok.decode(self.block, skip_special_tokens=False)
-        if not final and text.endswith("�"):
+        if not self.pending:
+            return
+        chunk = self.tok.decode(self.anchor_ids + self.pending, skip_special_tokens=False)
+        if not final and chunk.endswith("\ufffd"):
             return  # a multi-byte character is not complete yet
+        if chunk.startswith(self.anchor_text):
+            new = chunk[len(self.anchor_text):]
+            if new and self.mode in ("think", "text"):
+                self.events.append(("reasoning" if self.mode == "think" else "content", new))
+            self.sent += new
+            self._set_anchor()
+            self.pending = []
+            return
+        # Fallback if a token alters the decoded anchor boundary
+        text = self.tok.decode(self.block, skip_special_tokens=False)
+        if not final and text.endswith("\ufffd"):
+            return
         new = text[len(self.sent):]
         if new and self.mode in ("think", "text"):
             self.events.append(("reasoning" if self.mode == "think" else "content", new))
         self.sent = text
+        self._set_anchor()
+        self.pending = []
 
     def feed(self, t):
         i = self.ids
         if t == i[T_MODEL]:
-            self.mode, self.block, self.sent, self.header = "header", [], "", []
+            self._reset_block("header")
+            self.header = []
         elif self.mode == "header" and t == i[T_THINK]:
             self.mode = "think"
         elif self.mode == "header" and t == i[T_TEXT]:
@@ -281,16 +327,17 @@ class OutputParser:
                 self._flush(final=True)
             elif self.mode == "tool":
                 self._close_tool()
-            self.mode, self.block, self.sent = None, [], ""
+            self._reset_block(None)
         elif self.mode == "header":
             self.header.append(t)
         elif self.mode in ("think", "text", "tool"):
             self.block.append(t)
             if self.mode != "tool":
+                self.pending.append(t)
                 self._flush()
         else:
             # text outside any block (should not happen): treat as content
-            self.mode, self.block, self.sent = "text", [t], ""
+            self._reset_block("text", [t])
             self._flush()
 
     def _close_tool(self):
@@ -322,6 +369,7 @@ class Server:
         self.tmpl = load_template(assets / "chat_template.jinja")
         self.tok = Tokenizer.from_file(str(assets / "tokenizer.json"))
         self.ids = {s: self.tok.token_to_id(s) for s in (T_MODEL, T_THINK, T_TEXT, T_TOOL, T_END, T_STOP)}
+        self.eos_id = self.tok.token_to_id("<|endoftext|>")
         lib = Path(args.lib) if args.lib else HERE.parent / "build" / "libinkling.so"
         t0 = time.time()
         self.eng = Engine(lib, args.model, args.n_ctx, args.chunk, args.kv_bits, args.stash_ram_gb)
@@ -367,24 +415,30 @@ class Server:
         t1 = time.time()
         pos = len(toks)
         stop_id = self.ids[T_STOP]
+        eos_id = self.eos_id
         n_gen, finish = 0, "length"
         gen = []
+        next_tok = sample(self.eng.logits, temp, top_p, top_k, rng)
         while n_gen < max_new:
-            t = sample(self.eng.logits, temp, top_p, top_k, rng)
+            t = next_tok
             n_gen += 1
             gen.append(t)
-            if t == stop_id or t == self.tok.token_to_id("<|endoftext|>"):
+            if t == stop_id or t == eos_id:
                 finish = "stop"
                 break
             parser.feed(t)
             for kind, val in parser.take():
                 emit(kind, val)
-            if pos + 1 >= self.eng.n_ctx:
+            if pos + 1 >= self.eng.n_ctx or n_gen >= max_new:
                 break
             if gone is not None and n_gen % 16 == 0 and gone():
                 finish = "cancelled"
                 break
-            self.eng.step(t, pos)
+            if temp <= 0:
+                next_tok = self.eng.step_argmax(t, pos)
+            else:
+                self.eng.step(t, pos)
+                next_tok = sample(self.eng.logits, temp, top_p, top_k, rng)
             self.eng.tokens.append(t)
             pos += 1
         t2 = time.time()

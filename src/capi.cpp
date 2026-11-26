@@ -114,6 +114,12 @@ int ink_step(void * hp, int32_t tok, int pos, float * logits) {
     });
 }
 
+int ink_step_argmax(void * hp, int32_t tok, int pos) {
+    return guarded([&] {
+        return ((Handle *) hp)->eng->step_argmax(tok, pos);
+    });
+}
+
 int ink_save(void * hp, int id, int pos) {
     return guarded([&] {
         auto * h = (Handle *) hp;
