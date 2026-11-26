@@ -44,6 +44,30 @@ begin
 end > code-corpus.txt
 ```
 
+### Packed XMX prefill
+
+Stage `Kᵀ` and `V` in packed XMX operand layout and skip score masking only on full-attention tiles that need neither a causal mask nor relative bias.
+KV dequantization still multiplies in float before casting to half, and neither the stored KV layout nor the decode kernel changes.
+
+At 128k, the two-run medians were:
+
+- Cold prefill: **449.2 → 488.0 tok/s (+8.6%)**.
+- Uncached append: **309.8 → 347.1 tok/s (+12.1%)**.
+- Graph decode: **34.91 → 34.92 tok/s (flat)**.
+
+The repeat also copied out logits after the prefix, append, and final decode token; all three top-1 tokens matched the baseline engine and KL divergence was at most 0.00042.
+Both versions used the same amount of VRAM.
+
+On the same corpus with a 4,096-token prompt in an 8,192-token context, the two-run medians were 783.6 → 789.2 tok/s cold prefill, 757.0 → 764.7 tok/s for the append, and 57.78 → 57.82 tok/s graph decode.
+Against llama.cpp CPU, the baseline and packed path both matched top-1 at all three checked steps in each of two short runs for each KV precision.
+With 8-bit KV, the observed KL range was 0.0053–0.0513 before and 0.0065–0.0468 after.
+
+### Decode bottleneck at 128k
+
+In a separate synthetic profile at position 130,048, full attention took 11.57 ms/token, about 41% of summed kernel time.
+Batching the per-head softmax reductions cut full attention to 11.31 ms/token but moved synthetic decode only from 28.88 to 29.07 tok/s; changing the work-group size and moving query quantization out of the attention kernel were slower.
+These trials were not kept, and the measured graph decode rate on the populated coding cache remains below the 5% improvement target.
+
 ## Lessons
 
 1. **On this GPU the prompt kernels were limited by shared local memory (SLM), not by arithmetic.** The

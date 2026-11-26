@@ -688,7 +688,10 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
         const int mt = rows / 8;  // 8-row tiles
         constexpr int PVT = MAXR / 8 * (HD / 16) / RPG;  // output tiles per sub-group (at most)
         P("b_attn", q_.submit([&](sycl::handler & cgh) {
-            sycl::local_accessor<sycl::half, 1> sKV(2 * HD * KT > MAXR * HD ? 2 * HD * KT : MAXR * HD, cgh);  // Q staging, then [K^T | V]
+            // Q staging, then [K^T | V] with aligned stores of packed XMX operands.
+            using Half16 = sycl::vec<sycl::half, 16>;
+            constexpr int kv_tile = 2 * HD * KT > MAXR * HD ? 2 * HD * KT : MAXR * HD;
+            sycl::local_accessor<Half16, 1> sKV(kv_tile / 16, cgh);
             sycl::local_accessor<float, 1> sS(rows * KT, cgh);
             sycl::local_accessor<sycl::half, 1> sP(rows * KT, cgh);
             sycl::local_accessor<float, 1> sR(rows * 16, cgh);
@@ -704,14 +707,15 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
                 const int kvh = g / nqb, qb = g % nqb;
                 const int tq0 = qb * QB, nu = sycl::min(QB, n - tq0);
                 const int h0 = kvh * ratio;
-                auto pKV = sKV.template get_multi_ptr<sycl::access::decorated::no>();
+                auto * kv = reinterpret_cast<sycl::half *>(sKV.template get_multi_ptr<sycl::access::decorated::no>().get());
+                auto pKV = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(kv);
                 auto pS = sS.template get_multi_ptr<sycl::access::decorated::no>();
                 auto pP = sP.template get_multi_ptr<sycl::access::decorated::no>();
                 const auto pKT = pKV, pV = pKV + HD * KT;
                 // stage Q (scaled, f16), then this sub-group's Q tile into registers
                 for (int i = t; i < rows * HD; i += WG) {
                     const int r = i / HD, d = i % HD, j = r / QB, u = r % QB;
-                    sKV[i] = (sycl::half) (u < nu ? qf[(size_t) (tq0 + u) * nh * HD + (h0 + j) * HD + d] * scale : 0.0f);
+                    kv[i] = (sycl::half) (u < nu ? qf[(size_t) (tq0 + u) * nh * HD + (h0 + j) * HD + d] * scale : 0.0f);
                 }
                 for (int i = t; i < rows * n_rel; i += WG) {
                     const int r = i / n_rel, k = i % n_rel, j = r / QB, u = r % QB;
@@ -732,39 +736,49 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
                 sycl::group_barrier(grp);
                 const int pfirst = pos0 + tq0, plast = pos0 + tq0 + nu - 1;
                 const int klo = swa ? sycl::max(0, pfirst - n_swa + 1) : 0;
+                using Half8 = sycl::vec<sycl::half, 8>;
+                auto tile8 = [=](const int8_t * cache, const sycl::half * scales, size_t o) {
+                    float values[8];
+                    kv_get<8>(cache, kv4, o, values);
+                    const float d = (float) scales[o / 32];
+                    Half8 out;
+                    for (int e = 0; e < 8; ++e) out[e] = (sycl::half) (values[e] * d);
+                    return out;
+                };
                 for (int kt = klo; kt <= plast; kt += KT) {
-                    // K transposed: consecutive threads take consecutive keys (conflict-free local stores)
+                    // Pack adjacent K-operand elements for XMX as we stage them, instead of repacking at each load.
                     for (int i = t; i < KT * HD / 8; i += WG) {
                         const int j = i % KT, d8 = (i / KT) * 8;
                         const int k = kt + j;
-                        sycl::vec<sycl::half, 8> kv(0.0f);
+                        Half8 values(0.0f);
                         if (k <= plast) {
                             const size_t o = ((size_t) kvh * kvlen + (ring ? k % ring : k)) * HD + d8;
-                            float k8[8];
-                            kv_get<8>(kc, kv4, o, k8);
-                            const float kd = (float) ksc[o / 32];
-                            for (int e = 0; e < 8; ++e) kv[e] = (sycl::half) (k8[e] * kd);
+                            values = tile8(kc, ksc, o);
                         }
-                        for (int e = 0; e < 8; ++e) sKV[(d8 + e) * KT + j] = kv[e];
+                        for (int e = 0; e < 8; e += 2)
+                            *(sycl::vec<sycl::half, 2> *) &kv[(d8 + e) * KT + 2 * j] =
+                                sycl::vec<sycl::half, 2>(values[e], values[e + 1]);
                     }
-                    // V row-major: consecutive threads take consecutive 8-value pieces of a key
-                    for (int i = t; i < KT * HD / 8; i += WG) {
-                        const int j = i / (HD / 8), d8 = (i % (HD / 8)) * 8;
+                    // V is packed in consecutive key pairs; each thread stores eight interleaved dimensions.
+                    for (int i = t; i < KT * HD / 16; i += WG) {
+                        const int j = 2 * (i / (HD / 8)), d8 = (i % (HD / 8)) * 8;
+                        Half8 v0(0.0f), v1(0.0f);
+                        const size_t base = (size_t) kvh * kvlen * HD + d8;
                         const int k = kt + j;
-                        sycl::vec<sycl::half, 8> vv(0.0f);
-                        if (k <= plast) {
-                            const size_t o = ((size_t) kvh * kvlen + (ring ? k % ring : k)) * HD + d8;
-                            float v8[8];
-                            kv_get<8>(vc, kv4, o, v8);
-                            const float vd = (float) vsc[o / 32];
-                            for (int e = 0; e < 8; ++e) vv[e] = (sycl::half) (v8[e] * vd);
+                        if (k <= plast) v0 = tile8(vc, vsc, base + (size_t) (ring ? k % ring : k) * HD);
+                        if (k + 1 <= plast) v1 = tile8(vc, vsc, base + (size_t) (ring ? (k + 1) % ring : k + 1) * HD);
+                        Half16 packed;
+                        for (int e = 0; e < 8; ++e) {
+                            packed[2 * e] = v0[e];
+                            packed[2 * e + 1] = v1[e];
                         }
-                        *(sycl::vec<sycl::half, 8> *) &sKV[HD * KT + j * HD + d8] = vv;
+                        sKV[(HD * KT + j * HD + 2 * d8) / 16] = packed;
                     }
                     // bias rows for this tile's distances, coalesced into local memory once (the softmax step read
                     // them from global memory per (row, key): profiled as the kernel's main stall)
                     const int dlo = sycl::max(0, pfirst - (kt + KT - 1));
                     const bool bias = dlo < extent;
+                    const bool unmasked = !swa && !bias && nu == QB && kt + KT - 1 <= pfirst;
                     if (bias)
                         for (int i = t; i < (QB + KT) * 16; i += WG) {
                             const int dist = dlo + i / 16, e = i % 16;
@@ -775,8 +789,8 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
                         xmx::joint_matrix<sycl::sub_group, float, xmx::use::accumulator, 8, 16> sc;
                         xmx::joint_matrix_fill(sg, sc, 0.0f);
                         for (int kk = 0; kk < HD / 16; ++kk) {
-                            xmx::joint_matrix<sycl::sub_group, sycl::half, xmx::use::b, 16, 16, xmx::layout::row_major> mb;
-                            xmx::joint_matrix_load(sg, mb, pKT + kk * 16 * KT + qn * 16, KT);
+                            xmx::joint_matrix<sycl::sub_group, sycl::half, xmx::use::b, 16, 16, xmx::layout::ext_intel_packed> mb;
+                            xmx::joint_matrix_load(sg, mb, pKT + kk * 16 * KT + qn * 32, 2 * KT);
                             xmx::joint_matrix_mad(sg, sc, qa[kk], mb, sc);
                         }
                         xmx::joint_matrix_store(sg, sc, pS + qm * 8 * KT + qn * 16, KT, xmx::layout::row_major);
@@ -789,7 +803,8 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
                         for (int e2 = 0; e2 < 2; ++e2) {
                             const int j = 2 * lane + e2, k = kt + j;
                             float sx = -INFINITY;
-                            if (u < nu && k <= p && (!swa || p - k < n_swa)) {
+                            if (unmasked) sx = sS[r * KT + j];
+                            else if (u < nu && k <= p && (!swa || p - k < n_swa)) {
                                 sx = sS[r * KT + j];
                                 const int dist = p - k;
                                 if (dist < extent)
@@ -824,9 +839,9 @@ void FastEngine::bvisit(const Visit & v, int n, int pos0) {
                         xi::joint_matrix_apply(sg, acc[i], [&](float & x, size_t row, size_t) { x *= sA[m * 8 + (int) row]; });
                         for (int kk = 0; kk < KT; kk += 16) {
                             xmx::joint_matrix<sycl::sub_group, sycl::half, xmx::use::a, 8, 16, xmx::layout::row_major> ma;
-                            xmx::joint_matrix<sycl::sub_group, sycl::half, xmx::use::b, 16, 16, xmx::layout::row_major> mb;
+                            xmx::joint_matrix<sycl::sub_group, sycl::half, xmx::use::b, 16, 16, xmx::layout::ext_intel_packed> mb;
                             xmx::joint_matrix_load(sg, ma, pP + m * 8 * KT + kk, KT);
-                            xmx::joint_matrix_load(sg, mb, pV + kk * HD + nn * 16, HD);
+                            xmx::joint_matrix_load(sg, mb, pV + kk * HD + nn * 32, 2 * HD);
                             xmx::joint_matrix_mad(sg, acc[i], ma, mb, acc[i]);
                         }
                     }
