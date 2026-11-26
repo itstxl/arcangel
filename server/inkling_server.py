@@ -320,6 +320,17 @@ class Server:
         t0 = time.time()
         self.eng = Engine(lib, args.model, args.n_ctx, args.chunk, args.kv_bits, args.stash_ram_gb)
         print(f"engine ready in {time.time() - t0:.1f} s: context {args.n_ctx}, {args.kv_bits}-bit KV cache, prompt chunk {self.eng.chunk}, vocab {self.eng.n_vocab}", flush=True)
+        self.model_info = {
+            "id": args.name,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "arcangel",
+            "aliases": [args.name],
+            "tags": [],
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+            "context_length": self.eng.n_ctx,
+            "meta": {"n_ctx": self.eng.n_ctx, "n_vocab": self.eng.n_vocab},
+        }
         self.lock = threading.Lock()
         self.rng = np.random.default_rng()
 
@@ -415,8 +426,7 @@ def make_handler(server):
             if self.path == "/health":
                 return self._json(200, {"status": "ok"})
             if self.path.rstrip("/") == "/v1/models":
-                return self._json(200, {"object": "list", "data": [{"id": server.args.name, "object": "model", "owned_by": "arcangel",
-                                                                     "context_length": server.args.n_ctx}]})
+                return self._json(200, {"object": "list", "data": [server.model_info]})
             self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
