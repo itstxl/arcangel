@@ -18,6 +18,32 @@ oneAPI 2026.0, Unsloth UD-Q2_K_XL. Run-to-run noise is about ±10% on short runs
 Other GPUs (contributor reports): Arc Pro B60 51 tok/s full VRAM (Q4_K_XL, 256k), 35 tok/s offload (1M);
 Arc 140V (Lunar Lake) 21 tok/s, 226 tok/s prompt (Q4_K_M, 32k). See the README.
 
+## Arc Pro B60: 128k coding-agent baseline
+
+Measured at revision `ceb2403` with oneAPI 2026.2 (`bmg_g21` AOT), Inkling-2-Mini UD-Q4_K_XL, full-VRAM weights, and 8-bit KV.
+The engine used 2,346 MiB for KV and 281 MiB for prompt buffers with 1,024-token chunks in a 131,072-token context.
+One run of `bench/code_context.py`, restoring the empty engine snapshot after warmup, gave these rates (only engine time):
+
+- Cold prefill, 130,048 tokens: **449.2 tok/s**.
+- Uncached append, 1,024 tokens after a 129,024-token prefix: **309.6 tok/s**.
+- Graph decode, 128 fixed source-code tokens after that prompt: **34.93 tok/s**.
+
+The prompt corpus was the first 35 tracked `src/*.cpp` files from the llama.cpp checkout at `afe77e18fadc2e673c6a6299495a443e17378ce4`, wrapped as source reads.
+Use the serving tokenizer verified by `server/tokenizer.sha256`.
+The corpus SHA-256 was `494b1c2af5999b544ebaf1b2154ff81255b8dca137acd9b04ff88a448a06f652`.
+
+```fish
+set llama ~/llama.cpp
+set rev afe77e18fadc2e673c6a6299495a443e17378ce4
+begin
+    printf 'Review the following source files and propose a focused change with tests.\n'
+    for path in (git -C $llama ls-tree -r --name-only -z $rev src | string split0 | string match 'src/*.cpp' | head -n 35)
+        printf '\n--- tool: read_file %s ---\n' "$path"
+        git -C $llama show "$rev:$path"
+    end
+end > code-corpus.txt
+```
+
 ## Lessons
 
 1. **On this GPU the prompt kernels were limited by shared local memory (SLM), not by arithmetic.** The
