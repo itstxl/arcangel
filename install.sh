@@ -386,7 +386,7 @@ fetch_asset() {  # NAME SHA
   if [ -f "$f" ] && echo "$2  $f" | sha256sum -c --status; then return; fi
   curl -fsSL --retry 3 -o "$f.part" "https://huggingface.co/$BASE_REPO/resolve/main/$1"
   if ! echo "$2  $f.part" | sha256sum -c --status; then
-    warn "$1 differs from the version ArcAngel was tested with (the upstream file changed); using it anyway"
+    die "SHA-256 checksum mismatch for $1; refusing to install it"
   fi
   mv "$f.part" "$f"
 }
