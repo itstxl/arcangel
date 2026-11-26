@@ -32,6 +32,10 @@ add_library(inkcore STATIC
 )
 target_include_directories(inkcore PUBLIC src)
 target_compile_options(inkcore PUBLIC ${INK_SYCL_FLAGS} -Wall -Wextra)
+if(INK_AOT AND INK_AOT_TARGETS STREQUAL "lnl_m")
+  # 8-core Lunar Lake benefits from lower register pressure in k_gate_up_r (2 rows/SG vs 4 on discrete BMG)
+  target_compile_definitions(inkcore PRIVATE INK_GUR=2)
+endif()
 target_link_options(inkcore PUBLIC ${INK_SYCL_FLAGS})
 
 add_executable(ink-probe tools/probe.cpp)

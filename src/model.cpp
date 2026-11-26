@@ -369,7 +369,7 @@ Model::Model(sycl::queue & q, const GgufFile & f, bool repack) : q_(q) {
                                      " MiB + 4096 MiB spare, " + std::to_string(avail >> 20) + " MiB available");
     }
 
-    g_release_on = host_need > 0;
+    g_release_on = host_need > 0 || q_.get_device().get_info<sycl::info::device::host_unified_memory>();
     auto L = [&](const std::string & n, bool req = true) {
         return load(q_, f, n, req, weight_bytes, allocs_, repack, is_off(n), &host_bytes);
     };

@@ -40,7 +40,7 @@ DeviceInfo describe(const sycl::device & dev) {
     d.total_bytes = dev.get_info<sycl::info::device::global_mem_size>();
     d.max_alloc_bytes = dev.get_info<sycl::info::device::max_mem_alloc_size>();
     d.compute_units = dev.get_info<sycl::info::device::max_compute_units>();
-    if (dev.has(sycl::aspect::ext_intel_free_memory)) {
+    if (!dev.get_info<sycl::info::device::host_unified_memory>() && dev.has(sycl::aspect::ext_intel_free_memory)) {
         d.free_bytes = dev.get_info<sycl::ext::intel::info::device::free_memory>();
     }
     for (size_t s : dev.get_info<sycl::info::device::sub_group_sizes>()) {
