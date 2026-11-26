@@ -1,9 +1,9 @@
 # ArcAngel
 
-A fast local coding model for Intel Arc Battlemage cards. ArcAngel is an inference engine written for one
-model, [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), and one GPU family, Intel Xe2
-(Arc B570, B580, Pro B50, Pro B60, Pro B70). It serves an OpenAI-compatible API, so opencode and other
-coding agents can use it.
+A fast local coding model for Intel Arc Battlemage and Lunar Lake (Xe2) GPUs. ArcAngel is an inference engine
+written for one model, [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), and Intel Xe2
+GPUs (Arc B570, B580, Pro B50, Pro B60, Pro B70, and Lunar Lake integrated Arc 140V). It serves an
+OpenAI-compatible API, so opencode and other coding agents can use it.
 
 - **Everything stays in VRAM.** No offload to system RAM or disk: the engine refuses to start rather than
   spill.
@@ -38,6 +38,17 @@ Accuracy: against llama.cpp's CPU output the engine matches the top token on eve
 divergence 0.001-0.002 using an 8-bit cache and 0.006-0.016 using the 4-bit cache. With the 4-bit cache, it
 found hidden facts placed at 10%, 55% and 95% of a 90k-token prompt, and 4 of 4 facts in a 60k
 multi-fact test. How the speed was reached, step by step: [PERF.md](PERF.md).
+
+### Lunar Lake iGPU (Arc 140V)
+
+Core Ultra 7 258V (8 Xe2 cores, 32 GB LPDDR5X-8533 UMA), `UD-Q4_K_M`, 32k context (measured 2026-11-26):
+
+| Metric | ArcAngel | llama.cpp Vulkan + DSpark |
+|---|---|---|
+| Generation, short context (`graph`, 8-bit / 4-bit KV) | **21.08 / 21.10 tok/s** | ~12.2 tok/s |
+| Generation at 16k (`graph`, 8-bit / 4-bit KV) | **18.33 / 18.56 tok/s** | |
+| Prompt reading (2k prompt, `chunk=256 / 512`) | **198.2 / 225.8 tok/s** | ~46-49 tok/s |
+| Live server (`--chunk 512 --kv-bits 8`, greedy 512 tok) | **20.81 tok/s** | |
 
 ## Install
 
@@ -85,6 +96,7 @@ Every card has two recipes, and the installer asks which one you want (`--setup 
 | Arc Pro B50, 16 GB | UD-Q2_K_XL, 256k, 8-bit | UD-Q4_K_XL, 256k, 8-bit | both untested |
 | Arc Pro B60, 24 GB | UD-Q4_K_XL, 256k, 8-bit | UD-Q4_K_XL, 1M, 4-bit | **both tested** (by a contributor) |
 | Arc Pro B70, 32 GB | UD-Q4_K_XL, 512k, 8-bit | UD-Q4_K_XL, 1M, 8-bit | both untested |
+| Arc 140V (Lunar Lake), 32 GB UMA | UD-Q4_K_M, 32k, 8-bit | (UMA shares system RAM; CPU offload not used) | full GPU tested |
 
 Measured on the B580 (Ryzen 5 5600X, 32 GB DDR4), 2026-11-25. Offload generation depends on how well the
 hot-expert cache fits the text: 36-37 tok/s replaying real opencode requests, up to 40 in the benchmark.
@@ -227,7 +239,7 @@ another.
 
 ## Requirements
 
-- An Intel Arc Battlemage (Xe2) card on Linux with the `xe` (or `i915`) driver
+- An Intel Arc Battlemage or Lunar Lake (Xe2) GPU on Linux with the `xe` (or `i915`) driver
 - Intel oneAPI DPC++/C++ compiler 2025.1 or newer (tested: 2026.0), Level Zero, and the Intel compute runtime
   with `ocloc`
 - CMake 3.24+, Python 3.10+, about 10-20 GB of disk for the model
@@ -285,8 +297,7 @@ cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=Releas
 cmake --build build
 ```
 
-`INK_AOT_TARGETS` is `bmg_g21` (B570, B580, B50, B60), `bmg_g31` (B70), or both, comma separated. Stop the
-server before benchmarks: the GPU is usually the desktop's too, and long runs can make the desktop lag.
+`INK_AOT_TARGETS` is `bmg_g21` (B570, B580, B50, B60), `bmg_g31` (B70), `lnl_m` (Arc 140V / Lunar Lake; automatically sets `-DINK_GUR=2`), or a comma-separated list. Stop the server before benchmarks: the GPU is usually the desktop's too, and long runs can make the desktop lag.
 
 ```
 M=path/to/Inkling-2-Mini-UD-Q2_K_XL.gguf

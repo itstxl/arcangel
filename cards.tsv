@@ -1,7 +1,7 @@
 # ArcAngel card profiles, read by install.sh. One line per card, tab separated.
 #
 # id      the --card name
-# chip    AOT compile target (bmg_g21 or bmg_g31)
+# chip    AOT compile target (bmg_g21, bmg_g31, or lnl_m)
 # vram    memory on the card, GiB
 # quant   Unsloth UD quant of Inkling 2 Mini downloaded for this card (unsloth/Inkling-2-Mini-GGUF)
 # kv      K/V cache bits (8 or 4)
@@ -28,3 +28,4 @@ b580	bmg_g21	12	Q2_K_XL	4	98304	tested	Arc B580|8086:e20b	Arc B580 (12 GB)	Q4_K_
 b50	bmg_g21	16	Q2_K_XL	8	262144	untested	Arc Pro B50|8086:e212	Arc Pro B50 (16 GB)	Q4_K_XL	8	262144	0-5,18-23	untested
 b60	bmg_g21	24	Q4_K_XL	8	262144	tested	Arc Pro B60|8086:e211	Arc Pro B60 (24 GB)	Q4_K_XL	4	1048576	0-5,18-23	tested
 b70	bmg_g31	32	Q4_K_XL	8	524288	untested	Arc Pro B70|Battlemage G31	Arc Pro B70 (32 GB)	Q4_K_XL	8	1048576	0-5,18-23	untested
+140v	lnl_m	32	Q4_K_M	8	32768	tested	Arc 140V|8086:64a0	Arc 140V (Lunar Lake)	Q2_K_XL	4	98304	none	untested

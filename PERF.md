@@ -228,3 +228,25 @@ Note: `swa_chunk` / `INK_SWA_CHUNK` has no effect on graph-mode runs (the graph 
 The desktop (Hyprland, quickshell, Chromium) holds ~1 GB of VRAM and it moves: after the weights load, free
 VRAM has measured 1.8-2.2 GB. 64k context needs ~1.3-1.5 GB plus the 512 MiB margin, so start-up at 64k can
 fail when the desktop is busy (the planner refuses rather than spill).
+
+## Lunar Lake iGPU (Arc 140V / lnl_m) and UD-Q4_K_M optimizations (2026-11-26)
+
+Measured on an Intel Core Ultra 7 258V (Arc 140V iGPU, 8 Xe2 cores, 128-bit LPDDR5X-8533, 30.88 GiB OS-visible UMA), oneAPI 2026.0, Unsloth `UD-Q4_K_M` (32k context). Sustained GPU read bandwidth on `Q8_0R` dense kernels is **103-106 GB/s** (`proj:Q8_0R` 9.78 ms, `head:Q8_0R` 4.64 ms, `wo:Q8_0R` 3.62 ms). `UD-Q4_K_M` reads **3.95 GB** of active weights per decoded token (~37.2 ms / 26.9 tok/s bandwidth ceiling).
+
+All kernel/numeric changes were verified against pre-edit `libinkling.so` logits on a 16-token prefill + 8 greedy decode steps (`prefill` KL `0.000000`, decode steps KL `0.000016-0.001493`, 9/9 top-1 token matches, and `ink_step_argmax` matching `np.argmax`).
+
+### Summary of changes
+
+- **UMA memory handling (`src/device.cpp`, `src/model.cpp`):** On `host_unified_memory` devices, Level Zero's `ext_intel_free_memory` reports raw Linux `MemFree` (ignoring reclaimable file page cache and the TTM shrinker pool), causing `Model::check_fits` to reject loads falsely; skipping `free_memory` on UMA falls back to `total_bytes`. Enabling `g_release_on` on UMA drops mmap'd GGUF page cache (`MADV_DONTNEED` / `POSIX_FADV_DONTNEED`) after GPU upload so unified memory does not hold a duplicate ~16 GB copy. CPU expert offloading (`INK_OFFLOAD`) is not used on UMA because CPU and GPU share the same LPDDR5X bus and package TDP.
+- **`gate_up:NVFP4R` DP4A + `INK_GUR=2` (`src/fast.cpp`, `CMakeLists.txt`):** Added `q::NVFP4R` to `has_q8()` and `k_gate_up_r` using `fp4x4()` + `dot_acc` (`dp4a`) with 4-row activation reuse (`18.08 -> 12.60 ms` at `INK_GUR=4`, `-> 12.13 ms` at `INK_GUR=2`). `CMakeLists.txt` sets `-DINK_GUR=2` only when `INK_AOT_TARGETS STREQUAL "lnl_m"`, keeping `INK_GUR=4` on discrete Battlemage.
+- **`down:NVFP4R` (`8.66 -> 7.51 ms`, `src/quant.h`, `src/fast.cpp`):** Replaced `sycl::ldexp` in `q::ue4m3()` with bit-identical IEEE-754 bit-cast math, simplified `fp4x4()` byte-wise negation, shared `nvfp4_q8_dot()`, and hoisted `int4` activation loads out of the row loop in `k_down_q8()`. (`INK_DR=4` tested slower at `8.75 ms`, so `INK_DR=2` was kept.)
+- **`Q5_K` -> `Q5_KR` repacking + DP4A (`2.64 -> 1.43 ms`, `1.33 ms` at `INK_GUR=2`, `src/quant.h`, `src/model.cpp`, `src/kernels.h`, `src/fast.cpp`):** Added planar `Q5_KR` repacking (16 B low nibbles, 8 B `[qh u32, sc, m]`, 4 B `d`/`dmin`), `lane_dot`/`step_decode`, and `unit_q8x` DP4A; also sped up 2048-token prefill from `174.8` to `198.2 tok/s` (`chunk=256`).
+- **Server latency (`14.94 -> 20.81 tok/s` live greedy, `src/fast.*`, `src/capi.cpp`, `server/inkling_server.py`):** Added 2-stage GPU `k_argmax` (`step_argmax` / `ink_step_argmax`) transferring 4 bytes instead of 804 KB of logits on greedy (`temperature <= 0`) decoding, replaced O(N^2) full-block `OutputParser._flush()` detokenization with O(1) incremental anchor-window decoding, and skipped the extra final `step()` when hitting `max_new` or `n_ctx`.
+
+| Benchmark (`UD-Q4_K_M`, 32k ctx, Arc 140V) | Before | After |
+|---|---|---|
+| Decode (`graph`, 8-bit KV, pos 0) | 17.90 tok/s (55.87 ms) | **21.08 tok/s (47.44 ms)** |
+| Decode (`graph`, 4-bit KV, pos 0) | 17.91 tok/s (55.84 ms) | **21.10 tok/s (47.40 ms)** |
+| Decode (`graph`, 8-bit / 4-bit KV, pos 16000, `INK_GUR=4`) | 16.04 / 16.31 tok/s | **18.33 / 18.56 tok/s** |
+| Prefill (2048 tokens, `chunk=256` / `512`, `INK_GUR=4`) | 174.8 tok/s (`chunk=256`) | **198.2 / 225.8 tok/s** |
+| Live server (`--chunk 512 --kv-bits 8`, greedy 512 tok) | 14.94 tok/s (mean) | **20.81 tok/s** (24.61 s) |
