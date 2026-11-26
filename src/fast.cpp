@@ -22,11 +22,13 @@ namespace ink {
 
 // The input quantised to int8 in blocks of 32 (scale xd, block sum xs), as llama.cpp does for these formats.
 template <uint32_t T> constexpr bool has_q8() {
-    return T == q::IQ2_SR || T == q::IQ2_XXSR || T == q::IQ2_XSR || T == q::IQ1_SR || T == q::NVFP4R;
+    return T == q::IQ2_SR || T == q::IQ2_XXSR || T == q::IQ2_XSR || T == q::IQ1_SR || T == q::NVFP4R || T == q::Q5_KR;
 }
 
 // 4 bits -> 4 bytes of 0xFF where the bit is set
 inline uint32_t byte_mask4(uint32_t n) { return ((n * 0x00204081u) & 0x01010101u) * 0xFFu; }
+// 4 bits -> 4 bytes of 0x10 (16) where the bit is set, 0x00 otherwise
+inline uint32_t hi16x4(uint32_t bits4) { return ((bits4 * 0x00204081u) & 0x01010101u) << 4; }
 // 4 NVFP4 nibbles (one per byte, low 4 bits) -> 4 int8 values 2 * E2M1 = sign x {0, 1, 2, 3, 4, 6, 8, 12}
 inline int32_t fp4x4(uint32_t n) {
     const uint32_t m = n & 0x07070707u;
@@ -149,6 +151,26 @@ template <uint32_t T>
 inline float unit_q8x(const RowRef rr, int ib, const sycl::int4 x0, const sycl::int4 x1, float xdb, float xsb, const q::Tabs & tb) {
     if constexpr (T == q::NVFP4R) {
         return xdb * nvfp4_q8_dot(rr, ib, x0, x1);
+    } else if constexpr (T == q::Q5_KR) {
+        using sycl::ext::oneapi::dot_acc;
+        const uint32_t * wp = (const uint32_t *) (rr.p + 16 * ib);
+        const uint32_t w0 = wp[0], w1 = wp[1], w2 = wp[2], w3 = wp[3];
+        const uint32_t qh = *(const uint32_t *) (rr.a + 8 * ib);
+        const uint16_t sm = *(const uint16_t *) (rr.a + 8 * ib + 4);
+        const uint32_t dd = *(const uint32_t *) (rr.a2 + (ib / 8) * 4);
+        const float d = h2f_bits((uint16_t) (dd & 0xFFFFu));
+        const float dmin = h2f_bits((uint16_t) (dd >> 16));
+        const float sc = (float) (sm & 0xFFu);
+        const float mn = (float) (sm >> 8);
+        int32_t isum = dot_acc((int32_t) ((w0 & 0x0F0F0F0Fu) | hi16x4(qh & 0xFu)), x0[0], 0);
+        isum = dot_acc((int32_t) ((w1 & 0x0F0F0F0Fu) | hi16x4((qh >> 4) & 0xFu)), x0[1], isum);
+        isum = dot_acc((int32_t) ((w2 & 0x0F0F0F0Fu) | hi16x4((qh >> 8) & 0xFu)), x0[2], isum);
+        isum = dot_acc((int32_t) ((w3 & 0x0F0F0F0Fu) | hi16x4((qh >> 12) & 0xFu)), x0[3], isum);
+        isum = dot_acc((int32_t) (((w0 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 16) & 0xFu)), x1[0], isum);
+        isum = dot_acc((int32_t) (((w1 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 20) & 0xFu)), x1[1], isum);
+        isum = dot_acc((int32_t) (((w2 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 24) & 0xFu)), x1[2], isum);
+        isum = dot_acc((int32_t) (((w3 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 28) & 0xFu)), x1[3], isum);
+        return d * sc * xdb * (float) isum - dmin * mn * xsb;
     } else {
         return unit_dot<T>(unit_load<T>(rr, ib), x0, x1, xdb, xsb, tb);
     }
@@ -822,7 +844,7 @@ const char * type_name(uint32_t t) {
         case q::IQ4_XS: return "IQ4_XS"; case q::MXFP4: return "MXFP4"; case q::NVFP4: return "NVFP4"; case q::Q2_0: return "Q2_0";
         case q::Q8_0R: return "Q8_0R";
         case q::Q6_KR: return "Q6_KR";
-        case q::Q4_KR: return "Q4_KR"; case q::IQ2_XXSR: return "IQ2_XXSR"; case q::IQ2_XSR: return "IQ2_XSR";
+        case q::Q4_KR: return "Q4_KR"; case q::Q5_KR: return "Q5_KR"; case q::IQ2_XXSR: return "IQ2_XXSR"; case q::IQ2_XSR: return "IQ2_XSR";
         case q::IQ1_SR: return "IQ1_SR"; case q::IQ2_SR: return "IQ2_SR"; case q::NVFP4R: return "NVFP4R";
         case q::Q2_0R: return "Q2_0R";
         default: return "?";

@@ -76,7 +76,7 @@ template <class F> void dispatch_type(uint32_t t, F && f) {
     switch (t) {
         INK_T(F32) INK_T(F16) INK_T(BF16) INK_T(Q8_0) INK_T(Q4_K) INK_T(Q5_K) INK_T(Q6_K) INK_T(IQ2_XXS)
         INK_T(IQ2_XS) INK_T(IQ3_XXS) INK_T(IQ1_S) INK_T(IQ2_S) INK_T(IQ4_XS) INK_T(MXFP4) INK_T(NVFP4) INK_T(Q2_0)
-        INK_T(Q8_0R) INK_T(Q6_KR) INK_T(Q4_KR) INK_T(IQ2_XXSR) INK_T(IQ2_XSR) INK_T(IQ1_SR) INK_T(IQ2_SR)
+        INK_T(Q8_0R) INK_T(Q6_KR) INK_T(Q4_KR) INK_T(Q5_KR) INK_T(IQ2_XXSR) INK_T(IQ2_XSR) INK_T(IQ1_SR) INK_T(IQ2_SR)
         INK_T(NVFP4R) INK_T(Q2_0R)
     }
 #undef INK_T
@@ -268,6 +268,29 @@ inline float lane_dot(const RowRef rr, int cols, const float * x, const float * 
             acc += d * (float) sm[0] * slo - dmin * (float) sm[1] * xl + d * (float) sm[2] * shi - dmin * (float) sm[3] * xh;
         }
         return acc;
+    } else if constexpr (T == q::Q5_KR) {
+        // 32 values per step: 16 bytes of low nibbles (0..15 low, 16..31 high), u32 qh + (sc, m), (d, dmin) per 256
+        for (int s = lane; s < cols / 32; s += SG) {
+            const sycl::uint4 wv = *(const sycl::uint4 *) (row + 16 * s);
+            const uint32_t qh = *(const uint32_t *) (arow + 8 * s);
+            const uint16_t sm = *(const uint16_t *) (arow + 8 * s + 4);
+            const int b = s / 8, c0 = 32 * s;
+            const float d = q::f16(rr.a2 + 4 * b), dmin = q::f16(rr.a2 + 4 * b + 2);
+            const float d1 = d * (float) (sm & 0xFFu), m1 = dmin * (float) (sm >> 8);
+            const float * xs = c0 < split ? x + c0 : x2 + (c0 - split);
+            float sum = 0.0f, xsum = 0.0f;
+            for (int w = 0; w < 4; ++w)
+                for (int k = 0; k < 4; ++k) {
+                    const uint32_t byte = (wv[w] >> (8 * k)) & 0xFFu;
+                    const int j = 4 * w + k;
+                    const float qlo = (float) ((byte & 0xFu) + ((qh >> j) & 1u ? 16u : 0u));
+                    const float qhi = (float) ((byte >> 4) + ((qh >> (16 + j)) & 1u ? 16u : 0u));
+                    sum += qlo * xs[j] + qhi * xs[16 + j];
+                    xsum += xs[j] + xs[16 + j];
+                }
+            acc += d1 * sum - m1 * xsum;
+        }
+        return acc;
     }
     if constexpr (T == q::Q6_KR) {
         // int8 values, 16 per lane per step, scale d * sc per 16 values
@@ -375,7 +398,7 @@ template <int N> inline void kv_get(const int8_t * q, bool kv4, size_t o, float 
 
 template <uint32_t T> constexpr int step_vals() {
     if constexpr (T == q::Q8_0R || T == q::Q6_KR) return 16;
-    else if constexpr (T == q::NVFP4R || T == q::Q4_KR) return 32;
+    else if constexpr (T == q::NVFP4R || T == q::Q4_KR || T == q::Q5_KR) return 32;
     else if constexpr (T == q::Q2_0R || T == q::IQ2_SR || T == q::IQ2_XXSR || T == q::IQ2_XSR) return 64;
     else if constexpr (T == q::IQ1_SR) return 128;
     else if constexpr (q::shape(T).elems == 1) return 16;
@@ -479,6 +502,21 @@ template <uint32_t T, class Emit> inline void step_decode(const RowRef rr, int s
                 const int j = 4 * w + k;
                 emit(clo + j, d1 * (float) (byte & 0xF) - m1);
                 emit(chi + j, d2 * (float) (byte >> 4) - m2);
+            }
+    } else if constexpr (T == q::Q5_KR) {
+        const int c0 = 32 * s;
+        const sycl::uint4 wv = *(const sycl::uint4 *) (row + 16 * s);
+        const uint32_t qh = *(const uint32_t *) (arow + 8 * s);
+        const uint16_t sm = *(const uint16_t *) (arow + 8 * s + 4);
+        const int b = s / 8;
+        const float d = q::f16(rr.a2 + 4 * b), dmin = q::f16(rr.a2 + 4 * b + 2);
+        const float d1 = d * (float) (sm & 0xFFu), m1 = dmin * (float) (sm >> 8);
+        for (int w = 0; w < 4; ++w)
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t byte = (wv[w] >> (8 * k)) & 0xFFu;
+                const int j = 4 * w + k;
+                emit(c0 + j, d1 * (float) ((byte & 0xFu) + ((qh >> j) & 1u ? 16u : 0u)) - m1);
+                emit(c0 + 16 + j, d1 * (float) ((byte >> 4) + ((qh >> (16 + j)) & 1u ? 16u : 0u)) - m1);
             }
     } else if constexpr (q::shape(T).elems == 1) {
         const int c0 = 16 * s;

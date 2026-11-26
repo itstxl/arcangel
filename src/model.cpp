@@ -157,6 +157,37 @@ W load_impl(sycl::queue & q, const GgufFile & f, const std::string & name, bool 
             }
         });
     }
+    if (repack && t->type == q::Q5_K && cols % 256 == 0) {
+        return planes(q::Q5_KR, n32 * 16, n32 * 8, n256 * 4, [&](const uint8_t * src, uint8_t * v, uint8_t * a, uint8_t * a2) {
+            for (int64_t b = 0; b < n256; ++b) {
+                const uint8_t * blk = src + b * 176;
+                std::memcpy(a2 + b * 4, blk, 4);  // d, dmin
+                const uint8_t * qh_src = blk + 16;
+                const uint8_t * qs_src = blk + 48;
+                for (int c = 0; c < 8; ++c) {
+                    const int64_t ib = b * 8 + c;
+                    const int g = c / 2, hi = c & 1;
+                    const uint8_t * ql = qs_src + 32 * g;
+                    uint8_t sc, m;
+                    q::scale_min_k4(c, blk + 4, sc, m);
+                    for (int j = 0; j < 16; ++j) {
+                        const uint8_t lo = hi ? (ql[j] >> 4) : (ql[j] & 0xF);
+                        const uint8_t up = hi ? (ql[16 + j] >> 4) : (ql[16 + j] & 0xF);
+                        v[ib * 16 + j] = (uint8_t) (lo | (up << 4));
+                    }
+                    uint32_t qh_bits = 0;
+                    const uint8_t mask = (uint8_t) (1u << c);
+                    for (int l = 0; l < 32; ++l)
+                        if (qh_src[l] & mask) qh_bits |= (1u << l);
+                    std::memcpy(a + ib * 8, &qh_bits, 4);
+                    a[ib * 8 + 4] = sc;
+                    a[ib * 8 + 5] = m;
+                    a[ib * 8 + 6] = 0;
+                    a[ib * 8 + 7] = 0;
+                }
+            }
+        });
+    }
     if (repack && t->type == q::Q6_K && cols % 256 == 0) {
         // Q6_KR: the 6-bit values unpacked to int8 (q - 32), the int8 sub-block scales, the fp16 block scales.
         // Lossless: value = d * scale * q exactly as the file decodes. 8 + 0.5 + 0.06 bits per value.

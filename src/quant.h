@@ -19,6 +19,7 @@ enum Type : uint32_t {
     Q8_0R = 1008,
     Q6_KR = 1014,  // int8 values (q - 32), int8 scale per 16 values, fp16 d per 256
     Q4_KR = 1012,    // nibbles per block; (scale, min) bytes per 32; (d, dmin) per 256
+    Q5_KR = 1013,    // low nibbles (16B/32); [qh u32, sc u8, m u8, pad u16] (8B/32); (d, dmin) per 256
     IQ2_XXSR = 1016, // 8 bytes per 32 values; d per 256
     IQ2_XSR = 1017,  // 8 bytes per 32; scale byte per 32; d per 256
     IQ1_SR = 1019,   // 4 bytes per 32; qh u16 per 32; d per 256
@@ -86,6 +87,7 @@ constexpr BlockShape shape(uint32_t t) {
         case Q8_0R: return {32, 34};
         case Q6_KR: return {256, 210};
         case Q4_KR: return {256, 144};
+        case Q5_KR: return {256, 176};
         case IQ2_XXSR: return {256, 66};
         case IQ2_XSR: return {256, 74};
         case IQ1_SR: return {256, 50};
