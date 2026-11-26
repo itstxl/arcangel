@@ -21,10 +21,24 @@ namespace sycl_exp = sycl::ext::oneapi::experimental;
 namespace ink {
 
 // The input quantised to int8 in blocks of 32 (scale xd, block sum xs), as llama.cpp does for these formats.
-template <uint32_t T> constexpr bool has_q8() { return T == q::IQ2_SR || T == q::IQ2_XXSR || T == q::IQ2_XSR || T == q::IQ1_SR; }
+template <uint32_t T> constexpr bool has_q8() {
+    return T == q::IQ2_SR || T == q::IQ2_XXSR || T == q::IQ2_XSR || T == q::IQ1_SR || T == q::NVFP4R;
+}
 
 // 4 bits -> 4 bytes of 0xFF where the bit is set
 inline uint32_t byte_mask4(uint32_t n) { return ((n * 0x00204081u) & 0x01010101u) * 0xFFu; }
+// 4 NVFP4 nibbles (one per byte, low 4 bits) -> 4 int8 values 2 * E2M1 = sign x {0, 1, 2, 3, 4, 6, 8, 12}
+inline int32_t fp4x4(uint32_t n) {
+    const uint32_t m = n & 0x07070707u;
+    const uint32_t gt4 = ((m + 0x03030303u) >> 3) & 0x01010101u;  // m > 4
+    const uint32_t eq7 = ((m + 0x01010101u) >> 3) & 0x01010101u;  // m == 7
+    const uint32_t mask = gt4 * 0xFFu;
+    const uint32_t v = m + ((m & mask) - (0x04040404u & mask)) + 2 * eq7;  // m, but 5 6 7 -> 6 8 12
+    // negate each byte safely without inter-byte borrow (v <= 12 < 128; -0 stays 0)
+    const uint32_t neg = (0x80808080u - v) ^ 0x80808080u;
+    const uint32_t smask = ((n >> 3) & 0x01010101u) * 0xFFu;
+    return (int32_t) (v ^ ((v ^ neg) & smask));
+}
 // apply 8 sign bits to 8 grid bytes (each <= 0x2b, so the negation stays inside its byte)
 inline int32_t signed4(uint32_t g, uint32_t m) { return (int32_t) ((g ^ m) + (m & 0x01010101u)); }
 
@@ -60,6 +74,22 @@ template <uint32_t T> inline UnitRaw unit_load(const RowRef rr, int ib) {
     return u;
 }
 inline float h2f_bits(uint16_t b) { return (float) sycl::bit_cast<sycl::half>(b); }
+
+inline float nvfp4_q8_dot(const RowRef rr, int ub, const sycl::int4 x0, const sycl::int4 x1) {
+    using sycl::ext::oneapi::dot_acc;
+    const uint32_t * wp = (const uint32_t *) (rr.p + 16 * ub);
+    const uint32_t w0 = wp[0], w1 = wp[1], w2 = wp[2], w3 = wp[3];
+    int32_t is0 = dot_acc(fp4x4(w0), x0[0], 0);
+    is0 = dot_acc(fp4x4(w1), x0[1], is0);
+    is0 = dot_acc(fp4x4(w0 >> 4), x0[2], is0);
+    is0 = dot_acc(fp4x4(w1 >> 4), x0[3], is0);
+    int32_t is1 = dot_acc(fp4x4(w2), x1[0], 0);
+    is1 = dot_acc(fp4x4(w3), x1[1], is1);
+    is1 = dot_acc(fp4x4(w2 >> 4), x1[2], is1);
+    is1 = dot_acc(fp4x4(w3 >> 4), x1[3], is1);
+    const uint16_t sc = *(const uint16_t *) (rr.a + 2 * ub);
+    return q::ue4m3((uint8_t) (sc & 0xFFu)) * (float) is0 + q::ue4m3((uint8_t) (sc >> 8)) * (float) is1;
+}
 
 template <uint32_t T>
 inline float unit_dot(const UnitRaw & u, const sycl::int4 x0, const sycl::int4 x1, float xdb, float xsb, const q::Tabs & tb) {
@@ -117,7 +147,11 @@ inline float unit_dot(const UnitRaw & u, const sycl::int4 x0, const sycl::int4 x
 
 template <uint32_t T>
 inline float unit_q8x(const RowRef rr, int ib, const sycl::int4 x0, const sycl::int4 x1, float xdb, float xsb, const q::Tabs & tb) {
-    return unit_dot<T>(unit_load<T>(rr, ib), x0, x1, xdb, xsb, tb);
+    if constexpr (T == q::NVFP4R) {
+        return xdb * nvfp4_q8_dot(rr, ib, x0, x1);
+    } else {
+        return unit_dot<T>(unit_load<T>(rr, ib), x0, x1, xdb, xsb, tb);
+    }
 }
 
 template <uint32_t T>
@@ -672,37 +706,13 @@ sycl::event k_quant_act(sycl::queue & q, const float * x, int n, bool perm, int8
     });
 }
 
-// 4 NVFP4 nibbles (one per byte, low 4 bits) -> 4 int8 values 2 * E2M1 = sign x {0, 1, 2, 3, 4, 6, 8, 12}
-inline int32_t fp4x4(uint32_t n) {
-    const uint32_t m = n & 0x07070707u, s = (n >> 3) & 0x01010101u;
-    const uint32_t gt4 = ((m + 0x03030303u) >> 3) & 0x01010101u;  // m > 4
-    const uint32_t eq7 = ((m + 0x01010101u) >> 3) & 0x01010101u;  // m == 7
-    const uint32_t mask = gt4 * 0xFFu;
-    const uint32_t v = m + ((m & mask) - (0x04040404u & mask)) + 2 * eq7;  // m, but 5 6 7 -> 6 8 12
-    const uint32_t nz = ((v + 0x7F7F7F7Fu) >> 7) & 0x01010101u;   // v != 0 (keeps -0 from carrying)
-    const uint32_t sn = s & nz;
-    return (int32_t) ((v ^ (sn * 0xFFu)) + sn);
-}
-
 // one 32-value block ub of an expert row . int8 x, as a float (before the activation and expert scales)
-template <uint32_t T> inline float down_unit(const RowRef rr, int ub, const int8_t * xq, float xqs) {
+template <uint32_t T> inline float down_unit(const RowRef rr, int ub, const sycl::int4 x0, const sycl::int4 x1, float xqs) {
     using sycl::ext::oneapi::dot_acc;
-    const sycl::int4 * xv = (const sycl::int4 *) (xq + 32 * ub);
-    const sycl::int4 x0 = xv[0], x1 = xv[1];
-    const int32_t X[8] = {x0[0], x0[1], x0[2], x0[3], x1[0], x1[1], x1[2], x1[3]};
     if constexpr (T == q::NVFP4R) {
-        const sycl::uint4 wv = *(const sycl::uint4 *) (rr.p + 16 * ub);  // two 16-value sub-blocks of 8 bytes
-        float acc = 0.0f;
-        for (int t = 0; t < 2; ++t) {
-            const uint32_t w0 = wv[2 * t], w1 = wv[2 * t + 1];
-            int32_t is = dot_acc(fp4x4(w0), X[4 * t], 0);              // values 0-3: low nibbles of bytes 0-3
-            is = dot_acc(fp4x4(w1), X[4 * t + 1], is);                 // 4-7
-            is = dot_acc(fp4x4(w0 >> 4), X[4 * t + 2], is);            // 8-11: high nibbles
-            is = dot_acc(fp4x4(w1 >> 4), X[4 * t + 3], is);            // 12-15
-            acc += q::ue4m3(rr.a[2 * ub + t]) * (float) is;
-        }
-        return acc;
+        return nvfp4_q8_dot(rr, ub, x0, x1);
     } else {  // Q2_0R: 16-value words, field k at bits 2k = value k; x permuted by k_quant_act
+        const int32_t X[8] = {x0[0], x0[1], x0[2], x0[3], x1[0], x1[1], x1[2], x1[3]};
         const sycl::uint2 wv = *(const sycl::uint2 *) (rr.p + 8 * ub);
         int32_t is = 0;
         for (int w = 0; w < 2; ++w)
@@ -738,7 +748,9 @@ template <uint32_t T> sycl::event k_down_q8(sycl::queue & q, const DownQ8Args a8
             const int blk = k * nb + ub;
             const float f = a8.xd[blk] * a.wts[k] * (a.scale ? a.scale[e] : 1.0f), xqs = a8.xs[blk];
             const int8_t * xk = a8.xq + (size_t) k * a.cols;
-            for (int r = 0; r < RD; ++r) y[r] += down_unit<T>(row_of(a.w, (size_t) e * D + i0 + r), ub, xk, xqs) * f;
+            const sycl::int4 * xv = (const sycl::int4 *) (xk + 32 * ub);
+            const sycl::int4 x0 = xv[0], x1 = xv[1];
+            for (int r = 0; r < RD; ++r) y[r] += down_unit<T>(row_of(a.w, (size_t) e * D + i0 + r), ub, x0, x1, xqs) * f;
         }
         for (int r = 0; r < RD; ++r) {
             const float yy = sycl::reduce_over_group(sg, y[r], sycl::plus<float>());

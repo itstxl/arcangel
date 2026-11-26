@@ -43,11 +43,11 @@ inline float e8m0_half(uint8_t x) {
 
 // ggml_ue4m3_to_fp32 (already halved to match kvalues_fp4 = 2 * E2M1)
 inline float ue4m3(uint8_t x) {
-    if (x == 0 || x == 0x7F) return 0.0f;
-    const int e = (x >> 3) & 0xF;
-    const int m = x & 0x7;
-    const float raw = e == 0 ? sycl::ldexp((float) m, -9) : sycl::ldexp(1.0f + (float) m / 8.0f, e - 7);
-    return raw * 0.5f;
+    if (x == 0x7F) return 0.0f;
+    const uint32_t e = (x >> 3) & 0xFu;
+    const uint32_t m = x & 0x7u;
+    return e == 0 ? (float) m * (1.0f / 1024.0f)
+                  : sycl::bit_cast<float>(((e + 119u) << 23) | (m << 20));
 }
 
 inline void scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
