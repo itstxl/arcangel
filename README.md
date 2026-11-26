@@ -122,6 +122,50 @@ Why these models:
   layers and layers 20-23 (already Q8_0 in Q4_K_XL) to BF16. So the B60 and B70 spend memory on context.
 - Q3_K_XL, IQ3_XXS and IQ4_XS use weight formats the engine does not support yet (Q3_K, IQ3_S, IQ4_NL, Q5_0).
 
+## Run with Docker
+
+Use Docker with BuildKit on an x86-64 Linux host with an Intel Arc Battlemage GPU, the `xe` driver, and GPU firmware (Linux 6.12 or later).
+The image includes the userspace GPU runtime and checksum-verified tokenizer and chat template, so you don't need to run `install.sh` on the host.
+Download the GGUF for your card from [the model repository](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) separately and use a copy you trust.
+
+These commands use the B580 full-VRAM profile.
+Set `render_node` to the render device for your Arc card; on a multi-GPU host, check `/dev/dri/by-path/` for the mapping.
+
+```fish
+docker build --platform linux/amd64 -t arcangel .
+set render_node /dev/dri/renderD128
+set model (realpath ~/models/Inkling-2-Mini-UD-Q2_K_XL.gguf)
+docker run --rm \
+    --device "$render_node:$render_node:rw" \
+    --user (id -u):(id -g) --group-add (stat -c '%g' "$render_node") \
+    --cap-drop ALL --security-opt no-new-privileges=true \
+    --mount "type=bind,source=$model,target=/models/inkling.gguf,readonly" \
+    --publish 127.0.0.1:8082:8082 \
+    arcangel --model /models/inkling.gguf --n-ctx 98304 --kv-bits 4
+```
+
+The image defaults to `bmg_g21` (B570, B580, Pro B50 and Pro B60).
+For a Pro B70, add `--build-arg INK_AOT_TARGETS=bmg_g31` to `docker build`.
+For the offload recipe, pass `--env INK_OFFLOAD=<layers>` to `docker run`, using the layer ranges and matching GGUF from [cards.tsv](cards.tsv).
+If startup reports insufficient VRAM, lower `--n-ctx` or stop other GPU workloads.
+
+Once the model is loaded, check `curl -fsS http://127.0.0.1:8082/health`.
+The server listens on all interfaces **inside the container** so Docker can forward traffic, but the example publishes only to host loopback.
+Keep it that way for local use: the API does not authenticate requests.
+
+### Probe and benchmark in Docker
+
+Build the optional `diagnostics` image to run `ink-probe`, `bench-decode`, and `bench-prefill` with the same Intel runtime as the server.
+The default image does not build or ship these tools.
+
+```fish
+docker build --platform linux/amd64 --target diagnostics -t arcangel:diagnostics .
+```
+
+When running this image, use `--entrypoint /opt/arcangel/build/ink-probe` to probe the GPU instead of starting the server.
+Pass through your render node and mount the model as for the server, then pass the container path to the GGUF after the image name.
+For a Pro B70, add `--build-arg INK_AOT_TARGETS=bmg_g31` to the build command.
+
 ## Use
 
 ```
