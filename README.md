@@ -54,15 +54,14 @@ Core Ultra 7 258V (8 Xe2 cores, 32 GB LPDDR5X-8533 UMA), `UD-Q4_K_M`, 32k contex
 
 Batched-decode verify scaling (`test-verify`, `pos=2000`, `KV=4`): `1 tok` **`46.19 ms`** (`1.00x`), `VB=2` (`K=1`) **`64.03 ms`** (`1.39x`), `VB=4` (`K=3`) **`89.57 ms`** (`1.94x`), `VB=8` (`K=7`) **`144.00 ms`** (`3.12x`), with `worst KL 0.00519` and `verify_argmax: 0 mismatches`.
 
-| Workload | Mode | Throughput | Speedup | Acceptance (`tok/step`) |
+| Workload | Mode | Throughput | Speedup | Acceptance |
 |---|---|---:|---:|---:|
-| Prose (`n_ctx=8192`, `effort=high`, 256 tok) | Baseline / **DSpark `K=3`** | `22.63` / **`21.89 tok/s`** | `0.97x` | `42.0%` (`2.26`) |
-| Code edit (`n_ctx=8192`, `effort=none`, 512 tok) | Baseline / **DSpark `K=3`** / `K=7` | `19.36` / **`23.40`** / `20.08 tok/s` | **`1.21x`** / `1.04x` | `69.6%` (`3.08`) / `48.5%` (`4.37`) |
-| Live `128k` server — code edit (`temp=0.0`) | **DSpark `K=7`** | **`30.01 tok/s`** | — | `70.4%` (`5.93`) |
+| Prose (`n_ctx=8192`, `effort=high`, 256 tok) | Baseline / **DSpark `K=3`** | `22.63` / **`21.89 tok/s`** | `0.97x` | `42.0%` (`2.26 tok/step`) |
+| Code edit (`n_ctx=8192`, `effort=none`, 512 tok) | Baseline / **DSpark `K=3`** / `K=7` | `19.36` / **`23.40`** / `20.08 tok/s` | **`1.21x`** / `1.04x` | `69.6%` (`3.08`) / `48.5%` (`4.37` `tok/step`) |
+| Live `128k` server — code edit (`temp=0.0`) | **DSpark `K=7`** | **`30.01 tok/s`** | — | `70.4%` (`5.93 tok/step`) |
 | Live `128k` server — Python refactor (`temp=1.0`) | **`--spec-copy K=3`** | **`29.57 tok/s`** | — | `98.4%` (`496/504`) |
-| Live `128k` server — 164-task HumanEval (`medium` think) | **DSpark `K=3`** | **`21.43 tok/s`** weighted (`21.89` mean) | — | **91.5%** Base / **88.4%** Plus |
 
-*(On HumanEval at `EVALPLUS_MAX_NEW_TOKENS=2048`, 13/14 base failures were `finish length` truncations from `reasoning_effort=medium`; 148/149 clean-stop tasks passed Base.)* See [arcangel_spec_decode.md](arcangel_spec_decode.md), [spec_decode_arcangel.md](spec_decode_arcangel.md), and [dspark_phase2_design.md](dspark_phase2_design.md).
+- **164-task HumanEval soak (`128k` ctx, DSpark `K=3`, `reasoning_effort=medium`, `EVALPLUS_MAX_NEW_TOKENS=2048`):** **`21.43 tok/s` weighted** (`21.89` mean, up to `26.67 tok/s`), **91.5% Base (`150/164`) / 88.4% Plus (`145/164`)**; `13/14` base failures were `finish length` truncations at `2048` tokens (`148/149` clean-stop tasks passed Base). See [arcangel_spec_decode.md](arcangel_spec_decode.md), [spec_decode_arcangel.md](spec_decode_arcangel.md), and [dspark_phase2_design.md](dspark_phase2_design.md).
 
 ## Install
 
