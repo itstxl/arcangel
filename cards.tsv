@@ -6,7 +6,7 @@
 # quant   Unsloth UD quant of Inkling 2 Mini downloaded for this card (unsloth/Inkling-2-Mini-GGUF)
 # kv      K/V cache bits (8 or 4)
 # ctx     context length in tokens
-# status  tested: run on this card; untested: chosen from the card's memory, not run on one yet
+# status  tested: run on this card (B580 here, B60 by a contributor); untested: sized from the card's memory, not run yet
 # match   regular expression matched against `lspci` to detect the card
 # name    shown in the menu
 # oquant, okv, octx, olayers, ostatus: the offload recipe (--setup offload): quant, K/V bits, context, the
@@ -26,5 +26,5 @@
 b570	bmg_g21	10	IQ1_S	4	32768	untested	Arc B570|8086:e20c	Arc B570 (10 GB)	Q4_K_XL	4	32768	0-6,18-23	untested
 b580	bmg_g21	12	Q2_K_XL	4	98304	tested	Arc B580|8086:e20b	Arc B580 (12 GB)	Q4_K_XL	4	98304	0-5,18-23	tested
 b50	bmg_g21	16	Q2_K_XL	8	262144	untested	Arc Pro B50|8086:e212	Arc Pro B50 (16 GB)	Q4_K_XL	8	262144	0-5,18-23	untested
-b60	bmg_g21	24	Q4_K_XL	8	262144	untested	Arc Pro B60|8086:e211	Arc Pro B60 (24 GB)	Q4_K_XL	4	1048576	0-5,18-23	untested
+b60	bmg_g21	24	Q4_K_XL	8	262144	tested	Arc Pro B60|8086:e211	Arc Pro B60 (24 GB)	Q4_K_XL	4	1048576	0-5,18-23	tested
 b70	bmg_g31	32	Q4_K_XL	8	524288	untested	Arc Pro B70|Battlemage G31	Arc Pro B70 (32 GB)	Q4_K_XL	8	1048576	0-5,18-23	untested

@@ -82,7 +82,7 @@ Every card has two recipes, and the installer asks which one you want (`--setup 
 | Arc B570, 10 GB | UD-IQ1_S, 32k, 4-bit | UD-Q4_K_XL, 32k, 4-bit (one more loop layer in RAM) | both untested |
 | Arc B580, 12 GB | UD-Q2_K_XL, 96k, 4-bit | UD-Q4_K_XL, 96k, 4-bit | **both tested** |
 | Arc Pro B50, 16 GB | UD-Q2_K_XL, 256k, 8-bit | UD-Q4_K_XL, 256k, 8-bit | both untested |
-| Arc Pro B60, 24 GB | UD-Q4_K_XL, 256k, 8-bit | UD-Q4_K_XL, 1M, 4-bit | both untested |
+| Arc Pro B60, 24 GB | UD-Q4_K_XL, 256k, 8-bit | UD-Q4_K_XL, 1M, 4-bit | **both tested** (by a contributor) |
 | Arc Pro B70, 32 GB | UD-Q4_K_XL, 512k, 8-bit | UD-Q4_K_XL, 1M, 8-bit | both untested |
 
 Measured on the B580 (Ryzen 5 5600X, 32 GB DDR4), 2026-11-25. Offload generation depends on how well the
@@ -105,14 +105,21 @@ real opencode traffic. The cache follows what the model actually routes to, refr
 the same VRAM is used to stream each offloaded layer's experts in with the copy engine (14 GB/s, against
 ~8.6 GB/s for the GPU reading RAM directly), and the cache is refilled afterwards. Switch setups any time with `./install.sh --card <card> --setup vram|offload`.
 
-The profiles live in [cards.tsv](cards.tsv). Only the B580 has run them. The others were sized from each
-card's memory: weights, plus the K/V cache, plus prompt buffers, plus a 0.5 GB margin, plus about 1 GB for a
-desktop on the same card. What has been checked for them:
+The profiles live in [cards.tsv](cards.tsv). The B580's were run here; the Arc Pro B60's were run by a
+contributor (Debian 13, through the Docker image, Nov 2026):
+
+| Arc Pro B60 | Result |
+|---|---|
+| full VRAM: Q4_K_XL, 256k, 8-bit cache | 51.1 tok/s generation (short), 43.7 at 30k, 864 tok/s prompt at 4k; loads in 7 s; needles at 10/55/95% of 90k 3/3, 60k multi-fact 4/4, tool calls (streaming and not) |
+| offload: Q4_K_XL, 1M, 4-bit cache | 34.8 tok/s generation; loads in 12 s; a needle in a 300k-token prompt found |
+
+The others (B570, B50, B70) were sized from each card's memory: weights, plus the K/V cache, plus prompt
+buffers, plus a 0.5 GB margin, plus about 1 GB for a desktop on the same card. What has been checked for them:
 
 - the weight formats of Q4_K_XL and Q4_K_M (Q8_0 and Q5_K experts) match llama.cpp on a B580
-  (`tests/format_test.sh`), and Q4_K_XL runs end to end on a B580 in the offload setup;
-- the engine builds for the B70's chip (BMG-G31);
-- contexts above 96k have not been run on any card yet.
+  (`tests/format_test.sh`), and Q4_K_XL runs end to end on a B580 and a B60;
+- the engine builds for the B70's chip (BMG-G31), but has not run on one;
+- contexts up to 300k have run (on the B60); the 512k and 1M profiles have not been filled to the end.
 
 If you run one of the untested cards, please report how it went. If a profile does not fit (for example,
 because the desktop uses more VRAM), re-run the installer with a smaller `--ctx` or with `--kv-bits 4`.
