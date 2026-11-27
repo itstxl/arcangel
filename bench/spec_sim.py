@@ -19,6 +19,10 @@ F = {1: 1.0, 2: 0.82, 3: 0.73, 4: 0.66, 5: 0.62, 6: 0.58, 7: 0.55, 8: 0.51, 9: 0
 def cost(T, setup):
     if setup == "offload":  # dense + head once, attention/small per token, experts (GPU + CPU), overhead
         return 5.5 + 4 * T + 16.4 * T * F[T] + 1.5
+    if setup == "140v":  # Arc 140V UD-Q4_K_M, short ctx: dense+head 18.0, attn/small 7.4, experts ~22.0
+        return 18.0 + 7.4 + 22.0 * T * F[T] + 0.8 * (T - 1)
+    if setup == "140v_16k":  # Arc 140V UD-Q4_K_M, 16k ctx: shared KV read 14.0 + 18.0 + 22.0*T*F[T]
+        return 18.0 + 14.0 + 22.0 * T * F[T] + 0.8 * (T - 1)
     return 5.0 + 4 * T + 6.0 * T * F[T] + 1.0
 
 
@@ -58,7 +62,7 @@ def run(rows, K, minmatch, setup):
 
 if __name__ == "__main__":
     rows = [json.loads(l) for l in open(sys.argv[1])]
-    for setup in ("offload", "vram"):
+    for setup in ("offload", "vram", "140v", "140v_16k"):
         print(setup)
         for K in (1, 2, 3, 4, 8):
             print(f"  K={K} " + "  ".join(f"match>={m:2d}: x{run(rows, K, m, setup):.2f}" for m in (2, 4, 8, 16)))

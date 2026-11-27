@@ -55,10 +55,15 @@ class Engine:
         L.ink_error.restype = ctypes.c_char_p
         L.ink_n_vocab.argtypes = [ctypes.c_void_p]
         f32p = ctypes.POINTER(ctypes.c_float)
-        L.ink_prefill.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int, ctypes.c_int, f32p]
+        i32p = ctypes.POINTER(ctypes.c_int32)
+        L.ink_prefill.argtypes = [ctypes.c_void_p, i32p, ctypes.c_int, ctypes.c_int, f32p]
         L.ink_step.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int, f32p]
         L.ink_step_argmax.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int]
         L.ink_step_argmax.restype = ctypes.c_int
+        L.ink_verify.argtypes = [ctypes.c_void_p, i32p, ctypes.c_int, ctypes.c_int, f32p]
+        L.ink_commit.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        if hasattr(L, "ink_verify_argmax"):
+            L.ink_verify_argmax.argtypes = [ctypes.c_void_p, i32p, ctypes.c_int, ctypes.c_int, i32p]
         L.ink_save.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         L.ink_restore.argtypes = [ctypes.c_void_p, ctypes.c_int]
         L.ink_stash.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
@@ -72,6 +77,7 @@ class Engine:
         self.chunk = L.ink_chunk(self.h)
         self.logits = np.zeros(self.n_vocab, dtype=np.float32)
         self.lp = self.logits.ctypes.data_as(f32p)
+        self._vlogits = None
         self.tokens = []  # what the engine has processed, in order
         # host RAM per stashed prompt token: 8 full-attention slots x K and V x 8 heads x 128 dims, plus the
         # f16 scale per 32 values (the sliding-window slots add a fixed ~10-20 MB per stash)
@@ -99,6 +105,28 @@ class Engine:
 
     def step_argmax(self, tok, pos):
         return self.check(self.lib.ink_step_argmax(self.h, tok, pos))
+
+    def verify(self, toks, pos0):
+        n = len(toks)
+        if self._vlogits is None or self._vlogits.shape[0] < n:
+            self._vlogits = np.zeros((max(n, 8), self.n_vocab), dtype=np.float32)
+        arr = (ctypes.c_int32 * n)(*toks)
+        vp = self._vlogits.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        self.check(self.lib.ink_verify(self.h, arr, n, pos0, vp))
+        return self._vlogits[:n]
+
+    def verify_argmax(self, toks, pos0):
+        n = len(toks)
+        if hasattr(self.lib, "ink_verify_argmax"):
+            arr = (ctypes.c_int32 * n)(*toks)
+            out = (ctypes.c_int32 * n)()
+            self.check(self.lib.ink_verify_argmax(self.h, arr, n, pos0, out))
+            return [int(out[i]) for i in range(n)]
+        vl = self.verify(toks, pos0)
+        return [int(np.argmax(vl[i])) for i in range(n)]
+
+    def commit(self, keep):
+        self.check(self.lib.ink_commit(self.h, keep))
 
     # Whole conversations stashed in host RAM (full KV up to their prompt end), so a short unrelated request
     # (opencode's titles and summaries) does not cost the main conversation a full re-read.
@@ -232,9 +260,7 @@ def normalise_messages(messages):
 # --------------------------------------------------------------------------------------------------
 # sampling and output parsing
 
-def sample(logits, temperature, top_p, top_k, rng):
-    if temperature <= 0:
-        return int(np.argmax(logits))
+def filtered_probs(logits, temperature, top_p, top_k):
     k = top_k if top_k and top_k > 0 else 4096
     k = min(k, logits.size)
     idx = np.argpartition(logits, -k)[-k:]
@@ -246,7 +272,74 @@ def sample(logits, temperature, top_p, top_k, rng):
     if 0 < top_p < 1:
         keep = int(np.searchsorted(np.cumsum(p), top_p) + 1)
         idx, p = idx[:keep], p[:keep] / p[:keep].sum()
+    return idx, p
+
+
+def sample(logits, temperature, top_p, top_k, rng):
+    if temperature <= 0:
+        return int(np.argmax(logits))
+    idx, p = filtered_probs(logits, temperature, top_p, top_k)
     return int(rng.choice(idx, p=p))
+
+
+def verify_accept_greedy(draft, pred):
+    for a, d in enumerate(draft):
+        if pred[a] != d:
+            return a, int(pred[a])
+    return len(draft), int(pred[len(draft)])
+
+
+def verify_accept_probabilistic(draft, vlogits, temperature, top_p, top_k, rng):
+    for a, d in enumerate(draft):
+        idx, p = filtered_probs(vlogits[a], temperature, top_p, top_k)
+        matches = np.nonzero(idx == d)[0]
+        pd = float(p[matches[0]]) if matches.size else 0.0
+        if pd >= 1.0 or (pd > 0.0 and rng.random() < pd):
+            continue
+        if matches.size:
+            p = p.copy()
+            p[matches[0]] = 0.0
+            s = float(p.sum())
+            p = p / s if s > 0.0 else np.ones_like(p) / p.size
+        return a, int(rng.choice(idx, p=p))
+    return len(draft), sample(vlogits[len(draft)], temperature, top_p, top_k, rng)
+
+
+class PromptLookupDrafter:
+    """N-gram suffix matcher over prompt + accepted tokens (never matches the live suffix itself)."""
+
+    def __init__(self, seq=(), min_match=8, n_grams=(16, 8)):
+        self.min_match = min_match
+        self.n_grams = tuple(sorted({n for n in n_grams if n >= min_match} | {min_match}, reverse=True))
+        self.seq = []
+        self.idx = {}
+        self.reset(seq)
+
+    def _index_at(self, end):
+        for n in self.n_grams:
+            if end >= n:
+                self.idx[(n, tuple(self.seq[end - n:end]))] = end
+
+    def reset(self, seq):
+        self.seq = list(seq)
+        self.idx = {}
+        for end in range(1, len(self.seq)):
+            self._index_at(end)
+
+    def append(self, tok):
+        self.seq.append(tok)
+        if len(self.seq) > 1:
+            self._index_at(len(self.seq) - 1)
+
+    def propose(self, max_k):
+        if max_k <= 0:
+            return []
+        for n in self.n_grams:
+            if len(self.seq) >= n:
+                j = self.idx.get((n, tuple(self.seq[-n:])))
+                if j is not None:
+                    return list(self.seq[j:j + max_k])
+        return []
 
 
 class OutputParser:
@@ -416,6 +509,12 @@ class Server:
         pos = len(toks)
         stop_id = self.ids[T_STOP]
         eos_id = self.eos_id
+        spec_copy = bool(getattr(self.args, "spec_copy", False))
+        draft_k = int(getattr(self.args, "spec_draft_k", 3))
+        min_match = int(getattr(self.args, "spec_min_match", 8))
+        drafter = PromptLookupDrafter(toks, min_match=min_match) if spec_copy else None
+        spec_steps = spec_drafted = spec_accepted = 0
+        last_gone_check = 0
         n_gen, finish = 0, "length"
         gen = []
         next_tok = sample(self.eng.logits, temp, top_p, top_k, rng)
@@ -431,16 +530,62 @@ class Server:
                 emit(kind, val)
             if pos + 1 >= self.eng.n_ctx or n_gen >= max_new:
                 break
-            if gone is not None and n_gen % 16 == 0 and gone():
-                finish = "cancelled"
-                break
-            if temp <= 0:
-                next_tok = self.eng.step_argmax(t, pos)
+            if gone is not None and n_gen - last_gone_check >= 16:
+                last_gone_check = n_gen
+                if gone():
+                    finish = "cancelled"
+                    break
+            if drafter is not None:
+                drafter.append(t)
+                max_draft = min(draft_k, self.eng.n_ctx - pos - 2, max_new - n_gen - 1)
+                draft = drafter.propose(max_draft)
             else:
-                self.eng.step(t, pos)
-                next_tok = sample(self.eng.logits, temp, top_p, top_k, rng)
-            self.eng.tokens.append(t)
-            pos += 1
+                draft = []
+            if not draft:
+                if temp <= 0:
+                    next_tok = self.eng.step_argmax(t, pos)
+                else:
+                    self.eng.step(t, pos)
+                    next_tok = sample(self.eng.logits, temp, top_p, top_k, rng)
+                self.eng.tokens.append(t)
+                pos += 1
+            else:
+                batch = [t] + draft
+                if temp <= 0:
+                    pred = self.eng.verify_argmax(batch, pos)
+                    a, next_tok = verify_accept_greedy(draft, pred)
+                else:
+                    vlogits = self.eng.verify(batch, pos)
+                    a, next_tok = verify_accept_probabilistic(draft, vlogits, temp, top_p, top_k, rng)
+                spec_steps += 1
+                spec_drafted += len(draft)
+                spec_accepted += a
+                stop_i = next((i for i, dt in enumerate(draft[:a]) if dt == stop_id or dt == eos_id), None)
+                if stop_i is not None:
+                    self.eng.commit(stop_i + 1)
+                    self.eng.tokens.extend(batch[:stop_i + 1])
+                    pos += stop_i + 1
+                    for dt in draft[:stop_i]:
+                        n_gen += 1
+                        gen.append(dt)
+                        drafter.append(dt)
+                        parser.feed(dt)
+                        for kind, val in parser.take():
+                            emit(kind, val)
+                    n_gen += 1
+                    gen.append(draft[stop_i])
+                    finish = "stop"
+                    break
+                self.eng.commit(a + 1)
+                self.eng.tokens.extend(batch[:a + 1])
+                pos += a + 1
+                for dt in draft[:a]:
+                    n_gen += 1
+                    gen.append(dt)
+                    drafter.append(dt)
+                    parser.feed(dt)
+                    for kind, val in parser.take():
+                        emit(kind, val)
         t2 = time.time()
         if os.environ.get("ARCANGEL_TRACE"):  # developer aid: the token ids of every request, one JSON line each
             with open(os.environ["ARCANGEL_TRACE"], "a") as f:
@@ -454,6 +599,10 @@ class Server:
         timing = {"prompt_tokens": len(toks), "prompt_processed": processed, "prompt_s": round(t1 - t0, 3),
                   "completion_tokens": n_gen, "gen_s": round(t2 - t1, 3),
                   "gen_tok_s": round(n_gen / max(t2 - t1, 1e-9), 2)}
+        if spec_copy:
+            timing["spec_steps"] = spec_steps
+            timing["spec_drafted"] = spec_drafted
+            timing["spec_accepted"] = spec_accepted
         print(f"request: prompt {len(toks)} ({processed} new, {t1 - t0:.2f} s), generated {n_gen} "
               f"at {timing['gen_tok_s']} tok/s, finish {finish}", flush=True)
         return {"finish": finish, "tool_calls": parser.tool_calls, "timing": timing}
@@ -595,6 +744,9 @@ def main():
     ap.add_argument("--reasoning-effort", default="low")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--max-tokens", type=int, default=8192)
+    ap.add_argument("--spec-copy", action="store_true", help="enable prompt-lookup copy-drafting speculative decoding")
+    ap.add_argument("--spec-draft-k", type=int, default=3, choices=(1, 3, 7), help="max draft tokens per speculative step (VB=2/4/8)")
+    ap.add_argument("--spec-min-match", type=int, default=8, help="minimum suffix match length for copy drafting")
     args = ap.parse_args()
     server = Server(args)
     class Quiet(ThreadingHTTPServer):
