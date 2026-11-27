@@ -67,6 +67,23 @@ uses a GGUF you already have; `--ctx N`, `--kv-bits 4|8` and `--port N` override
 card's two recipes.
 </details>
 
+### Docker
+
+If you would rather not install oneAPI on your machine, build the image instead. The host only needs the GPU
+kernel driver (`xe`, Linux 6.12+); the compiler stays in the build stage and the image you run is ~0.8 GB.
+
+```
+docker build -t arcangel .
+docker run -d --name arcangel --device /dev/dri -p 8082:8082 -v /path/to/models:/models arcangel \
+  --model /models/Inkling-2-Mini-UD-Q4_K_XL.gguf --n-ctx 262144 --kv-bits 8
+```
+
+Use your card's recipe from [cards.tsv](cards.tsv) for `--model`, `--n-ctx` and `--kv-bits`. For the offload
+setup add `-e INK_OFFLOAD=0-5,18-23 --ulimit memlock=-1`. Any other `inkling_server.py` option can follow the
+image name. The model is not in the image: download it from
+[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) into the mounted folder.
+`--build-arg AOT=bmg_g21` builds for one chip only (faster).
+
 ### Two setups per card
 
 Every card has two recipes, and the installer asks which one you want (`--setup vram` or `--setup offload`):
