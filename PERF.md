@@ -5,14 +5,18 @@ oneAPI 2026.0, Unsloth UD-Q2_K_XL. Run-to-run noise is about ±10% on short runs
 >= 2k prompt tokens and repeat before trusting a difference. Correctness gate for every change:
 `test-forward MODEL ref/p1 prefill` (and `graph` for decode) must report MATCH with KL in the 0.001-0.002 range.
 
-## Where things stand (2026-11-25)
+## Where things stand (2026-11-27, Arc B580)
 
 | | llama.cpp Vulkan + DSpark | engine, full VRAM (Q2_K_XL) | engine, offload (Q4_K_XL) |
 |---|---|---|---|
-| decode, short context | 33-38 tok/s | 65 tok/s | 36-40 tok/s |
-| decode at 4k / 12k / 30k / 90k (4-bit KV) | ~18 tok/s at 30k | 64 / 62 / 57 / 47 tok/s | 35-37 at 30k |
-| prompt 4k / 16k / 32k / 90k | ~225 tok/s at 4k | 925 / 870 / 815 / 597 tok/s | 585 / 570 at 4k / 16k |
+| decode, short context | 33-38 tok/s | 67 tok/s | 44 tok/s |
+| decode at 4k / 12k / 30k / 90k (4-bit KV) | ~18 tok/s at 30k | 66 / 64 / 60 / 48 tok/s | 41 at 30k |
+| decode, copy-heavy edit with copy drafting | | ~100 tok/s | (not with offloading) |
+| prompt 4k / 16k / 32k / 90k | ~225 tok/s at 4k | 949 / 899 / 850 / 659 tok/s | 609 / 590 at 4k / 16k |
 | context | 32k (drafter) / 64k | 96k (4-bit KV) | 96k (4-bit KV) |
+
+Other GPUs (contributor reports): Arc Pro B60 51 tok/s full VRAM (Q4_K_XL, 256k), 35 tok/s offload (1M);
+Arc 140V (Lunar Lake) 21 tok/s, 226 tok/s prompt (Q4_K_M, 32k). See the README.
 
 ## Lessons
 
