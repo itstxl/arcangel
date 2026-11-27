@@ -80,7 +80,7 @@ Every card has two recipes ([cards.tsv](cards.tsv)), and the installer asks whic
 | **Arc B580** | 12 GB | UD-Q2_K_XL, 96k, 4-bit | UD-Q4_K_XL, 96k, 4-bit | **both** |
 | Arc Pro B50 | 16 GB | UD-Q2_K_XL, 256k, 8-bit | UD-Q4_K_XL, 256k, 8-bit | not yet |
 | **Arc Pro B60** | 24 GB | UD-Q4_K_XL, 256k, 8-bit | UD-Q4_K_XL, 1M, 4-bit | **both** (contributor) |
-| Arc Pro B70 | 32 GB | UD-Q4_K_XL, 512k, 8-bit | UD-Q4_K_XL, 1M, 8-bit | not yet (builds) |
+| **Arc Pro B70** | 32 GB | UD-Q4_K_XL, 512k, 8-bit | UD-Q4_K_XL, 1M, 8-bit | **full VRAM** (contributor) |
 | **Arc 140V** (Lunar Lake iGPU) | 32 GB shared | UD-Q4_K_M, 32k, 8-bit | UD-Q2_K_XL, 96k, 4-bit (no offload: memory is shared) | **full VRAM** (contributor) |
 
 The untested recipes were sized from each card's memory. If one does not fit, for example because your
@@ -153,6 +153,20 @@ Reported by [@marcellbaan](https://github.com/marcellbaan) (Debian 13, through t
 |---|---|
 | full VRAM: Q4_K_XL, 256k, 8-bit | 51 tok/s generation, 44 at 30k, 864 tok/s prompt at 4k; long-context recall tests pass |
 | offload: Q4_K_XL, 1M, 4-bit | 35 tok/s generation; a fact hidden in a 300k-token prompt found |
+
+### Arc Pro B70 (32 GB)
+
+Reported by [@iwillnotbecomeu](https://github.com/iwillnotbecomeu) (Ubuntu 26.04 VM with the card passed through,
+oneAPI 2026.2.1), full-VRAM recipe: UD-Q4_K_XL, 512k context, 8-bit cache, at commit 3b3b202 (before the
+latest kernel speed-ups):
+
+| | Result |
+|---|---|
+| Load / VRAM | 18.4 s / 25.9 GiB |
+| Short coding prompt | **64.9 tok/s** generation |
+| 72k-token prompt | **970 tok/s** prompt reading, **50.8 tok/s** generation |
+
+Prompts up to ~72k tokens were run; the 512k context loads but has not been filled.
 
 ### Arc 140V (Lunar Lake)
 

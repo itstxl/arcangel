@@ -8,6 +8,13 @@ conf=${ARCANGEL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/arcangel/arcangel.env}
 [ -f "$conf" ] && . "$conf"
 
 oneapi=${ONEAPI_ROOT:-/opt/intel/oneapi}
+# The full oneAPI environment: a systemd service does not inherit a login shell's, and with Intel's packages
+# (e.g. Ubuntu, oneAPI 2026.2) the library path alone leaves the SYCL runtime without its Level Zero adapter
+# ("no Level Zero GPU found"). Distribution packages (Arch) also work with just the library path below.
+if [ -f "$oneapi/setvars.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$oneapi/setvars.sh" --force >/dev/null 2>&1 || true
+fi
 export LD_LIBRARY_PATH=$oneapi/compiler/latest/lib:$oneapi/tbb/latest/lib:$oneapi/umf/latest/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 model=${ARCANGEL_MODEL:-$INK_MODEL}
