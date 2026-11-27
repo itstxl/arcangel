@@ -47,7 +47,8 @@ git clone https://github.com/itstxl/arcangel && cd arcangel
 ```
 
 That is all. The installer asks two questions, which card (it detects yours) and which setup (full VRAM or
-offload, see below), shows a plan of what it will do, and after one "Go ahead?" does the rest:
+offload, see below), plus, if you have Docker, whether to run natively or [in Docker](#run-with-docker). It
+shows a plan of what it will do, and after one "Go ahead?" does the rest:
 
 1. installs the compiler and GPU runtime if they are missing (asks for your password)
 2. downloads the model from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF),
@@ -130,6 +131,12 @@ Why these models:
 - Q3_K_XL, IQ3_XXS and IQ4_XS use weight formats the engine does not support yet (Q3_K, IQ3_S, IQ4_NL, Q5_0).
 
 ## Run with Docker
+
+`./install.sh` can do the steps below for you: when Docker works on your machine it asks whether to run
+natively or in Docker (`--docker` to choose it up front). It then downloads the model, creates `.env` with
+`make .env` and fills in your card's recipe (an existing `.env` is backed up and only `MODELS_DIR`, `MODEL`,
+`N_CTX`, `KV_BITS`, `INK_OFFLOAD` and `INK_AOT_TARGETS` are changed), builds the image, and sets up the
+`arcangel` service to run `docker compose up`. Or do it by hand:
 
 Use Docker with BuildKit and the Docker Compose plugin on an x86-64 Linux host with an Intel Arc Battlemage GPU, the `xe` driver, and GPU firmware (Linux 6.12 or later).
 The image includes the userspace GPU runtime and checksum-verified tokenizer and chat template, so you don't need to run `install.sh` on the host.

@@ -27,7 +27,7 @@ BASE_REPO=thinkingmachines/Inkling-2-Mini
 # sha256 of the assets the server was validated with (both Apache-2.0, from $BASE_REPO)
 TOKENIZER_SHA=7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6
 
-setup="" card="" model="" port=8082 ctx="" kv="" yes=0 deps=1 build_only=0 service=1 opencode=1 start=1 models_dir="$DATA/models"
+route="" setup="" card="" model="" port=8082 ctx="" kv="" yes=0 deps=1 build_only=0 service=1 opencode=1 start=1 models_dir="$DATA/models"
 
 usage() {
   sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
@@ -36,6 +36,8 @@ usage() {
 Options:
   --card ID          card profile (see --list-cards); default: detected
   --setup vram|offload  full-VRAM recipe (default) or the offload recipe (needs ~32 GB of system RAM)
+  --docker           run the engine in a container (compose.yaml), nothing but Docker installed on the host
+  --native           build and run natively (the default when Docker is not chosen)
   --model FILE       use a GGUF you already have instead of downloading
   --models-dir DIR   where to download models (default: $DATA/models)
   --ctx N            context length (default: the card's profile)
@@ -55,6 +57,8 @@ while [ $# -gt 0 ]; do
   case $1 in
     --card) card=$2; shift ;;
     --setup) setup=$2; shift ;;
+    --docker) route=docker ;;
+    --native) route=native ;;
     --model) model=$2; shift ;;
     --models-dir) models_dir=$2; shift ;;
     --ctx) ctx=$2; shift ;;
@@ -81,6 +85,7 @@ step() { echo; echo "${B}==> $*${N}"; }
 ok() { echo "  ${G}ok${N} $*"; }
 warn() { echo "  ${Y}warning:${N} $*"; }
 die() { echo "${R}error:${N} $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
 ask() {  # ask "question" default(y/n) -> 0 for yes
   local a d=$2
   if [ $yes = 1 ]; then [ "$d" = y ]; return; fi
@@ -179,6 +184,39 @@ if [ -n "$detected" ] && [ "$detected" != "$card" ]; then
 fi
 
 # ------------------------------------------------------------------------------------------------------
+# how to run it: natively (build here) or in Docker (compose.yaml: only Docker on the host). Docker is offered
+# when it works without sudo, and recommended where the native route cannot work (Debian: no Intel GPU
+# compute runtime packages; unknown distributions).
+docker_ok=0
+docker compose version >/dev/null 2>&1 && docker info >/dev/null 2>&1 && docker_ok=1
+os_id=$( (. /etc/os-release 2>/dev/null; echo "${ID:-}") )
+native_hard=0
+case $os_id in arch|cachyos|endeavouros|manjaro|ubuntu|fedora|pop|linuxmint) ;; *) native_hard=1 ;; esac
+grep -qsE '^ID_LIKE=.*(arch|ubuntu|fedora)' /etc/os-release && native_hard=0
+[ "$os_id" = debian ] && native_hard=1
+if [ $build_only = 1 ]; then
+  route=native
+elif [ -z "$route" ]; then
+  if [ $docker_ok = 1 ] && [ $yes = 0 ]; then
+    def=1; [ $native_hard = 1 ] && def=2
+    echo
+    echo "  How should ArcAngel run?"
+    echo "    1) Natively   builds the engine here; installs Intel's compiler and GPU runtime (~8 GB)"
+    echo "    2) In Docker  builds an image (compose.yaml); nothing but Docker on this machine, same speed"
+    [ $native_hard = 1 ] && echo "                  (recommended here: this distribution has no Intel GPU runtime packages)"
+    read -r -p "  Which? [$def] " pick
+    case ${pick:-$def} in 1) route=native ;; 2) route=docker ;; *) die "no such choice: $pick" ;; esac
+  else
+    route=native
+  fi
+fi
+if [ "$route" = docker ]; then
+  [ $docker_ok = 1 ] || die "the Docker route needs Docker with the compose plugin, usable without sudo (add yourself to the 'docker' group, or use rootless Docker)"
+  [ "$port" = 8082 ] || warn "the Docker route publishes port 8082 (set in compose.yaml); --port is ignored"
+  port=8082
+fi
+
+# ------------------------------------------------------------------------------------------------------
 # the plan: everything the installer will do, confirmed once (then no more questions)
 if [ $yes = 0 ] && [ $build_only = 0 ]; then
   have_model=""
@@ -190,6 +228,7 @@ if [ $yes = 0 ] && [ $build_only = 0 ]; then
   echo
   echo "${B}==> Plan${N}"
   echo "  setup:     $cname, $setup: $quant, $((ctx / 1024))k context, $kv-bit K/V cache${offload:+, experts of layers $offload in RAM}"
+  echo "  runs:      $([ "$route" = docker ] && echo "in Docker (compose.yaml, settings in $REPO/.env)" || echo natively)"
   if [ -n "$have_model" ]; then
     echo "  model:     use $have_model"
   else
@@ -197,8 +236,12 @@ if [ $yes = 0 ] && [ $build_only = 0 ]; then
          python3 -c "import json,sys; print(next((f.get('size',0) for f in json.load(sys.stdin) if f['path']=='$gguf_name'),0))" 2>/dev/null || echo 0)
     echo "  model:     download $gguf_name ($(awk -v b="$sz" 'BEGIN { printf "%.1f", b / 1e9 }') GB) to $models_dir"
   fi
-  echo "  packages:  install the compiler / GPU runtime if missing (your package manager, asks for your password)"
-  echo "  build:     compile the engine for $chip (a few minutes)"
+  if [ "$route" = docker ]; then
+    echo "  build:     the arcangel image for $chip (docker compose build; the compiler stays in the build stage)"
+  else
+    echo "  packages:  install the compiler / GPU runtime if missing (your package manager, asks for your password)"
+    echo "  build:     compile the engine for $chip (a few minutes)"
+  fi
   if [ $service = 1 ] && command -v systemctl >/dev/null 2>&1; then
     echo "  service:   'arcangel' (systemd user service), API on http://127.0.0.1:$port/v1, started at the end"
   fi
@@ -214,10 +257,10 @@ if [ $yes = 0 ] && [ $build_only = 0 ]; then
   yes=1  # confirmed: no more questions from here on
 fi
 
+if [ "$route" = native ]; then
 # ------------------------------------------------------------------------------------------------------
 step "2/6 Build tools and GPU runtime"
 
-have() { command -v "$1" >/dev/null 2>&1; }
 # distribution family from /etc/os-release: arch, debian (Ubuntu, Debian, Mint, Pop!_OS...), fedora, or other
 distro=other
 if [ -r /etc/os-release ]; then
@@ -275,7 +318,8 @@ install_deps() {
       if [[ " ${have_pkgs[*]} " != *" libze-intel-gpu1 "* ]] || [[ " ${have_pkgs[*]} " != *" intel-ocloc "* ]]; then
         die "this distribution has no packages for the Intel GPU compute runtime (libze-intel-gpu1, intel-ocloc).
   Debian 13 does not ship it: install Intel's release packages from https://github.com/intel/compute-runtime/releases
-  (and the matching intel-graphics-compiler), then run install.sh again. Ubuntu 24.04+ works out of the box."
+  (and the matching intel-graphics-compiler), then run install.sh again, or run it with --docker (only
+  Docker needed on the host). Ubuntu 24.04+ works out of the box."
       fi
       sudo apt-get install -y "${have_pkgs[@]}" ;;
     fedora)
@@ -300,7 +344,8 @@ if [ ${#missing[@]} -gt 0 ]; then
   warn "missing: ${missing[*]}"
   if [ $distro = other ]; then
     cat <<EOF
-  Unknown distribution: install these yourself, then run install.sh again:
+  Unknown distribution: install these yourself, then run install.sh again (or run install.sh --docker,
+  which needs nothing but Docker on this machine):
     - Intel oneAPI DPC++/C++ compiler 2025.1 or newer (icpx):
       https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compiler-download.html
     - the Intel GPU compute runtime with Level Zero and ocloc
@@ -516,6 +561,104 @@ EOF
   fi
 fi
 
+fi  # native route
+
+# ------------------------------------------------------------------------------------------------------
+# the Docker route: model, .env for compose.yaml, the image, the service. compose.yaml, the Makefile and
+# .env.example are used as they are; .env is created with `make .env`, and an existing one is backed up and
+# only its recipe keys (MODELS_DIR, MODEL, N_CTX, KV_BITS, INK_OFFLOAD, INK_AOT_TARGETS) are set.
+if [ "$route" = docker ]; then
+step "2/6 Model"
+if [ -z "$model" ]; then
+  for d in "$models_dir" "$HOME/.local/share/llama.cpp/models" "$HOME/models"; do
+    [ -f "$d/$gguf_name" ] && { model=$d/$gguf_name; break; }
+  done
+fi
+if [ -n "$model" ]; then
+  [ -f "$model" ] || die "no such file: $model"
+  ok "using $model"
+else
+  mkdir -p "$models_dir"
+  model=$models_dir/$gguf_name
+  echo "  downloading $gguf_name to $models_dir (resumes if interrupted)"
+  curl -fL --retry 5 -C - -o "$model.part" "https://huggingface.co/$GGUF_REPO/resolve/main/$gguf_name" ||
+    die "download failed: run install.sh again to resume"
+  mv "$model.part" "$model"
+  ok "$model"
+fi
+model=$(realpath "$model")
+
+step "3/6 Settings for compose.yaml ($REPO/.env)"
+# the render node of the Intel GPU (the first Intel one; set RENDER_NODE in .env on multi-GPU hosts)
+node=""
+for r in /dev/dri/renderD*; do
+  [ "$(cat "/sys/class/drm/$(basename "$r")/device/vendor" 2>/dev/null)" = 0x8086 ] && { node=$r; break; }
+done
+[ -n "$node" ] || die "no Intel GPU render node in /dev/dri: is the xe driver loaded (Linux 6.12+)?"
+if [ -e "$REPO/.env" ]; then
+  cp "$REPO/.env" "$REPO/.env.bak-arcangel"
+  ok "kept your .env (backup: .env.bak-arcangel); setting only this recipe's keys"
+else
+  make -s -C "$REPO" .env RENDER_NODE="$node" || die "make .env failed (see above)"
+  ok "created .env with make .env (your user and group, the render node $node)"
+fi
+set_env() {  # KEY VALUE: replace KEY=..., or uncomment "# KEY=...", or append
+  local k=$1 v=$2 f=$REPO/.env
+  if grep -q "^$k=" "$f"; then sed -i "s|^$k=.*|$k=$v|" "$f"
+  elif grep -q "^# $k=" "$f"; then sed -i "0,/^# $k=.*/s||$k=$v|" "$f"
+  else printf '%s=%s\n' "$k" "$v" >> "$f"; fi
+}
+unset_env() {  # KEY: comment it out
+  sed -i "s|^$1=|# $1=|" "$REPO/.env"
+}
+set_env MODELS_DIR "$(dirname "$model")"
+set_env MODEL "$(basename "$model")"
+set_env N_CTX "$ctx"
+set_env KV_BITS "$kv"
+if [ -n "$offload" ]; then set_env INK_OFFLOAD "$offload"; else unset_env INK_OFFLOAD; fi
+if [ "$chip" = bmg_g21 ]; then unset_env INK_AOT_TARGETS; else set_env INK_AOT_TARGETS "$chip"; fi
+grep -E '^(MODELS_DIR|MODEL|N_CTX|KV_BITS|INK_OFFLOAD|INK_AOT_TARGETS)=' "$REPO/.env" | sed 's/^/    /'
+
+step "4/6 Image (docker compose build)"
+docker compose --project-directory "$REPO" build 2>&1 | grep -E '^ *(Image|#[0-9]+ ERROR|ERROR)|failed' || true
+docker image inspect arcangel >/dev/null 2>&1 || die "the image did not build (run: docker compose --project-directory $REPO build)"
+ok "image arcangel"
+
+step "5/6 Service"
+mkdir -p "$CONF_DIR"
+cat > "$CONF_DIR/arcangel.env" <<EOF
+# ArcAngel runs in Docker: its settings are in $REPO/.env (compose.yaml). Written by install.sh.
+ARCANGEL_ROUTE=docker
+ARCANGEL_CARD=$card
+ARCANGEL_SETUP=$setup
+EOF
+if [ $service = 1 ] && have systemctl; then
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/arcangel.service" <<EOF
+[Unit]
+Description=ArcAngel in Docker (compose.yaml in $REPO), OpenAI API on 127.0.0.1:8082
+# Not started at login unless you enable it: it holds most of the card's memory while running.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env docker compose --project-directory $REPO up --no-build
+ExecStop=/usr/bin/env docker compose --project-directory $REPO down
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  ok "systemd user service 'arcangel' (runs docker compose up)"
+  if [ "${autostart:-}" = 1 ] || { [ -z "${autostart:-}" ] && ask "Start ArcAngel automatically when you log in?" n; }; then
+    systemctl --user enable arcangel >/dev/null 2>&1 && ok "enabled at login"
+  fi
+else
+  echo "  start it with: docker compose --project-directory $REPO up"
+fi
+fi  # docker route
+
 # ------------------------------------------------------------------------------------------------------
 step "6/6 opencode"
 
@@ -580,10 +723,15 @@ fi
 
 echo
 echo "${B}Done.${N} ArcAngel: $cname, $setup setup, $gguf_name, $((ctx / 1024))k context."
-echo "  switch:      ./install.sh --card $card --setup $([ $setup = vram ] && echo offload || echo vram)"
+echo "  switch:      ./install.sh --card $card --setup $([ $setup = vram ] && echo offload || echo vram)$([ "$route" = docker ] && echo " --docker")"
+if [ "$route" = docker ]; then
+  echo "  docker:      settings in $REPO/.env (compose.yaml); logs: docker compose --project-directory $REPO logs -f"
+fi
 if [ $service = 1 ]; then
   echo "  start/stop:  systemctl --user start arcangel / systemctl --user stop arcangel"
   echo "  logs:        journalctl --user -u arcangel -f"
+elif [ "$route" = docker ]; then
+  echo "  start:       docker compose --project-directory $REPO up"
 else
   echo "  start:       $REPO/server/run.sh"
 fi
