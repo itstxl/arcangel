@@ -41,7 +41,7 @@ target_link_options(inkcore PUBLIC ${INK_SYCL_FLAGS})
 add_executable(ink-probe tools/probe.cpp)
 target_link_libraries(ink-probe PRIVATE inkcore)
 
-target_sources(inkcore PRIVATE src/engine.cpp src/fast.cpp src/prefill.cpp src/cpu_experts.cpp)
+target_sources(inkcore PRIVATE src/engine.cpp src/fast.cpp src/prefill.cpp src/verify.cpp src/cpu_experts.cpp)
 
 add_executable(test-forward tests/test_forward.cpp)
 target_link_libraries(test-forward PRIVATE inkcore)

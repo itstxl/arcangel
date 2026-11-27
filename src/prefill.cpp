@@ -1267,19 +1267,12 @@ void FastEngine::bhist(const char * label, const float * raw, size_t rs, int slo
     }));
 }
 
-const std::vector<float> & FastEngine::verify(const std::vector<int> & tokens, int pos0) {
+const std::vector<float> & FastEngine::verify_prefill(const std::vector<int> & tokens, int pos0) {
     const Hparams & h = hp_;
     const int n = (int) tokens.size();
     if (n < 1 || n > VMAX || n > TB_) throw std::runtime_error("verify: 1 to 16 tokens");
     if (pos0 + n > n_ctx_) throw std::runtime_error("verify: context is full");
-    if (!vraw_) {
-        vraw_ = dev<float>((size_t) h.n_slot() * VMAX * h.conv_channels());
-        vlogits_ = dev<float>((size_t) VMAX * h.n_vocab);
-        vhist_ = sycl::malloc_device<float *>((size_t) h.n_slot(), q_);
-        allocs_.push_back(vhist_);
-        std::vector<float *> hp(hist_.begin(), hist_.end());
-        q_.memcpy(vhist_, hp.data(), hp.size() * sizeof(float *)).wait();
-    }
+    ensure_vraw();
     verify_ = true;
     vn_ = n;
     // INK_VERIFY_XMX=0 tries the non-XMX kernels for the batch (measured: slower, 168 ms for 1 token)

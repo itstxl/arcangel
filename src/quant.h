@@ -13,9 +13,10 @@
 namespace ink::q {
 
 enum Type : uint32_t {
-    F32 = 0, F16 = 1, Q8_0 = 8, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17,
+    F32 = 0, F16 = 1, Q5_0 = 6, Q8_0 = 8, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17,
     IQ3_XXS = 18, IQ1_S = 19, IQ2_S = 22, IQ4_XS = 23, BF16 = 30, MXFP4 = 39, NVFP4 = 40, Q2_0 = 42,
     // repacked layouts (kernel formats, never in a file): values in one aligned plane, scales in another
+    Q5_0R = 1006,    // low nibbles (16B/32); qh u32 (4B/32); f16 d (2B/32)
     Q8_0R = 1008,
     Q6_KR = 1014,  // int8 values (q - 32), int8 scale per 16 values, fp16 d per 256
     Q4_KR = 1012,    // nibbles per block; (scale, min) bytes per 32; (d, dmin) per 256
@@ -71,6 +72,7 @@ constexpr BlockShape shape(uint32_t t) {
         case F32: return {1, 4};
         case F16: return {1, 2};
         case BF16: return {1, 2};
+        case Q5_0: return {32, 22};
         case Q8_0: return {32, 34};
         case Q4_K: return {256, 144};
         case Q5_K: return {256, 176};
@@ -84,6 +86,7 @@ constexpr BlockShape shape(uint32_t t) {
         case MXFP4: return {32, 17};
         case NVFP4: return {64, 36};
         case Q2_0: return {64, 18};
+        case Q5_0R: return {32, 22};
         case Q8_0R: return {32, 34};
         case Q6_KR: return {256, 210};
         case Q4_KR: return {256, 144};
@@ -118,6 +121,18 @@ inline void decode32f(uint32_t type, const uint8_t * b, int chunk, Out && out, c
     using tables::kvalues_iq4nl;
     using tables::kvalues_fp4;
     switch (type) {
+        case Q5_0: {  // d, qh[4], qs[16]
+            const float d = f16(b);
+            const uint32_t qh = rd32(b + 2);
+            const uint8_t * qs = b + 6;
+            for (int j = 0; j < 16; ++j) {
+                const int xh0 = ((qh >> j) & 1u) ? 16 : 0;
+                const int xh1 = ((qh >> (16 + j)) & 1u) ? 16 : 0;
+                out(j + 0, (float) (((qs[j] & 0x0F) | xh0) - 16) * d);
+                out(j + 16, (float) (((qs[j] >> 4) | xh1) - 16) * d);
+            }
+            break;
+        }
         case Q8_0: {
             const float d = f16(b);
             for (int j = 0; j < 32; ++j) out(j, (float) (int8_t) b[2 + j] * d);

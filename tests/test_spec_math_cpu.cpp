@@ -27,8 +27,10 @@ constexpr int D = 2304;
 constexpr int V_MMAX = 4;
 
 enum Type : uint32_t {
+    Q5_0R = 1006,
     Q8_0R = 1008,
     Q6_KR = 1014,
+    Q4_KR = 1012,
     IQ2_XXSR = 1016,
     IQ2_XSR = 1017,
     IQ1_SR = 1019,
@@ -174,6 +176,32 @@ inline float ref_unit_q8x(const RowRef rr, int ib, const int4_sim x0, const int4
         isum = dot_acc((int32_t) (((wp[2] >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 24) & 0xFu)), x1[2], isum);
         isum = dot_acc((int32_t) (((wp[3] >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 28) & 0xFu)), x1[3], isum);
         return d * sc * xdb * (float) isum - dmin * mn * xsb;
+    } else if constexpr (T == Q4_KR) {
+        const int b = ib / 8, j = ib % 8, g = j / 2, sh = (j & 1) ? 4 : 0;
+        const uint32_t * wp = (const uint32_t *) (rr.p + b * 128 + g * 32);
+        uint16_t sm;
+        uint32_t dd;
+        std::memcpy(&sm, rr.a + ib * 2, 2);
+        std::memcpy(&dd, rr.a2 + b * 4, 4);
+        const float d = f16_bits_to_f32((uint16_t) (dd & 0xFFFFu));
+        const float dmin = f16_bits_to_f32((uint16_t) (dd >> 16));
+        int32_t isum = 0;
+        for (int k = 0; k < 4; ++k) isum = dot_acc((int32_t) ((wp[k] >> sh) & 0x0F0F0F0Fu), x0[k], isum);
+        for (int k = 0; k < 4; ++k) isum = dot_acc((int32_t) ((wp[4 + k] >> sh) & 0x0F0F0F0Fu), x1[k], isum);
+        return d * (float) (sm & 0xFFu) * xdb * (float) isum - dmin * (float) (sm >> 8) * xsb;
+    } else if constexpr (T == Q5_0R) {
+        const uint32_t * wp = (const uint32_t *) (rr.p + 16 * ib);
+        uint32_t qh;
+        std::memcpy(&qh, rr.a + 4 * ib, 4);
+        int32_t isum = dot_acc((int32_t) ((wp[0] & 0x0F0F0F0Fu) | hi16x4(qh & 0xFu)), x0[0], 0);
+        isum = dot_acc((int32_t) ((wp[1] & 0x0F0F0F0Fu) | hi16x4((qh >> 4) & 0xFu)), x0[1], isum);
+        isum = dot_acc((int32_t) ((wp[2] & 0x0F0F0F0Fu) | hi16x4((qh >> 8) & 0xFu)), x0[2], isum);
+        isum = dot_acc((int32_t) ((wp[3] & 0x0F0F0F0Fu) | hi16x4((qh >> 12) & 0xFu)), x0[3], isum);
+        isum = dot_acc((int32_t) (((wp[0] >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 16) & 0xFu)), x1[0], isum);
+        isum = dot_acc((int32_t) (((wp[1] >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 20) & 0xFu)), x1[1], isum);
+        isum = dot_acc((int32_t) (((wp[2] >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 24) & 0xFu)), x1[2], isum);
+        isum = dot_acc((int32_t) (((wp[3] >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 28) & 0xFu)), x1[3], isum);
+        return f16(rr.a2 + 2 * ib) * xdb * (float) (isum - 16 * (int32_t) xsb);
     } else if constexpr (T == Q2_0R) {
         const int32_t X[8] = {x0[0], x0[1], x0[2], x0[3], x1[0], x1[1], x1[2], x1[3]};
         const uint32_t * wv = (const uint32_t *) (rr.p + 8 * ib);
@@ -295,6 +323,34 @@ inline DecodedU32 decode_unit_q8(const RowRef rr, int ib, const Tabs & tb) {
         u.s0 = d * (float) (sm & 0xFFu);
         u.s1 = 0.0f;
         u.m0 = -dmin * (float) (sm >> 8);
+    } else if constexpr (T == Q4_KR) {
+        const int b = ib / 8, j = ib % 8, g = j / 2, sh = (j & 1) ? 4 : 0;
+        const uint32_t * wp = (const uint32_t *) (rr.p + b * 128 + g * 32);
+        uint16_t sm;
+        uint32_t dd;
+        std::memcpy(&sm, rr.a + ib * 2, 2);
+        std::memcpy(&dd, rr.a2 + b * 4, 4);
+        const float d = f16_bits_to_f32((uint16_t) (dd & 0xFFFFu));
+        const float dmin = f16_bits_to_f32((uint16_t) (dd >> 16));
+        for (int k = 0; k < 8; ++k) u.w[k] = (int32_t) ((wp[k] >> sh) & 0x0F0F0F0Fu);
+        u.s0 = d * (float) (sm & 0xFFu);
+        u.s1 = 0.0f;
+        u.m0 = -dmin * (float) (sm >> 8);
+    } else if constexpr (T == Q5_0R) {
+        const uint32_t * wp = (const uint32_t *) (rr.p + 16 * ib);
+        uint32_t qh;
+        std::memcpy(&qh, rr.a + 4 * ib, 4);
+        u.w[0] = (int32_t) ((wp[0] & 0x0F0F0F0Fu) | hi16x4(qh & 0xFu));
+        u.w[1] = (int32_t) ((wp[1] & 0x0F0F0F0Fu) | hi16x4((qh >> 4) & 0xFu));
+        u.w[2] = (int32_t) ((wp[2] & 0x0F0F0F0Fu) | hi16x4((qh >> 8) & 0xFu));
+        u.w[3] = (int32_t) ((wp[3] & 0x0F0F0F0Fu) | hi16x4((qh >> 12) & 0xFu));
+        u.w[4] = (int32_t) (((wp[0] >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 16) & 0xFu));
+        u.w[5] = (int32_t) (((wp[1] >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 20) & 0xFu));
+        u.w[6] = (int32_t) (((wp[2] >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 24) & 0xFu));
+        u.w[7] = (int32_t) (((wp[3] >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 28) & 0xFu));
+        u.s0 = f16(rr.a2 + 2 * ib);
+        u.s1 = 0.0f;
+        u.m0 = 0.0f;
     } else if constexpr (T == Q2_0R) {
         const uint32_t * wv = (const uint32_t *) (rr.p + 8 * ib);
         for (int w = 0; w < 2; ++w)
@@ -367,16 +423,21 @@ inline DecodedU32 decode_unit_q8(const RowRef rr, int ib, const Tabs & tb) {
 
 template <uint32_t T>
 inline float dot_decoded_q8(const DecodedU32 & u, const int4_sim x0, const int4_sim x1, float xdb, float xsb) {
-    if constexpr (T == Q5_KR) {
+    if constexpr (T == Q5_KR || T == Q4_KR) {
         int32_t isum = 0;
         for (int i = 0; i < 4; ++i) isum = dot_acc(u.w[i], x0[i], isum);
         for (int i = 0; i < 4; ++i) isum = dot_acc(u.w[4 + i], x1[i], isum);
         return u.s0 * xdb * (float) isum + u.m0 * xsb;
+    } else if constexpr (T == Q5_0R) {
+        int32_t isum = 0;
+        for (int i = 0; i < 4; ++i) isum = dot_acc(u.w[i], x0[i], isum);
+        for (int i = 0; i < 4; ++i) isum = dot_acc(u.w[4 + i], x1[i], isum);
+        return u.s0 * xdb * (float) (isum - 16 * (int32_t) xsb);
     } else if constexpr (T == Q2_0R) {
         int32_t isum = 0;
         for (int i = 0; i < 4; ++i) isum = dot_acc(u.w[i], x0[i], isum);
         for (int i = 0; i < 4; ++i) isum = dot_acc(u.w[4 + i], x1[i], isum);
-        return u.s0 * (float) (isum - (int32_t) xsb);
+        return u.s0 * xdb * (float) (isum - (int32_t) xsb);
     } else if constexpr (T == IQ1_SR) {
         int32_t isum = 0;
         for (int i = 0; i < 4; ++i) isum = dot_acc(u.w[i], x0[i], isum);
@@ -397,8 +458,8 @@ void check_unpack_format(const char * name, std::mt19937 & rng, const Tabs & tb)
     std::uniform_real_distribution<float> fdist(0.01f, 0.5f);
     double max_diff = 0.0;
     for (int iter = 0; iter < 500; ++iter) {
-        uint8_t p[16]{}, a[8]{}, a2[4]{};
-        for (int i = 0; i < 16; i += 4) {
+        uint8_t p[32]{}, a[8]{}, a2[4]{};
+        for (int i = 0; i < 32; i += 4) {
             uint32_t r = u32(rng);
             std::memcpy(p + i, &r, 4);
         }
@@ -426,8 +487,8 @@ void check_unpack_format(const char * name, std::mt19937 & rng, const Tabs & tb)
             int4_sim x0{}, x1{};
             std::memcpy(x0.v, xq, 16);
             std::memcpy(x1.v, xq + 16, 16);
-            const float xdb = fdist(rng);
-            const float xsb = (float) xsum * (T == Q2_0R ? 1.0f : xdb);
+            const float xdb = (T == Q2_0R || T == Q5_0R) ? 1.0f : fdist(rng);
+            const float xsb = (float) xsum * ((T == Q2_0R || T == Q5_0R) ? 1.0f : xdb);
             const float ref = ref_unit_q8x<T>(rr, 0, x0, x1, xdb, xsb, tb);
             const float got = dot_decoded_q8<T>(u, x0, x1, xdb, xsb);
             const double diff = std::abs((double) ref - (double) got);
@@ -1005,6 +1066,8 @@ int main() {
 
     check_unpack_format<NVFP4R>("NVFP4R", rng, tb);
     check_unpack_format<Q5_KR>("Q5_KR", rng, tb);
+    check_unpack_format<Q4_KR>("Q4_KR", rng, tb);
+    check_unpack_format<Q5_0R>("Q5_0R", rng, tb);
     check_unpack_format<Q2_0R>("Q2_0R", rng, tb);
     check_unpack_format<IQ1_SR>("IQ1_SR", rng, tb);
     check_unpack_format<IQ2_SR>("IQ2_SR", rng, tb);

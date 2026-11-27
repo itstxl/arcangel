@@ -14,35 +14,9 @@
 #include <stdexcept>
 #include <type_traits>
 
-#include <sycl/ext/oneapi/dot_product.hpp>
-
 namespace sycl_exp = sycl::ext::oneapi::experimental;
 
 namespace ink {
-
-// The input quantised to int8 in blocks of 32 (scale xd, block sum xs), as llama.cpp does for these formats.
-template <uint32_t T> constexpr bool has_q8() {
-    return T == q::IQ2_SR || T == q::IQ2_XXSR || T == q::IQ2_XSR || T == q::IQ1_SR || T == q::NVFP4R || T == q::Q5_KR;
-}
-
-// 4 bits -> 4 bytes of 0xFF where the bit is set
-inline uint32_t byte_mask4(uint32_t n) { return ((n * 0x00204081u) & 0x01010101u) * 0xFFu; }
-// 4 bits -> 4 bytes of 0x10 (16) where the bit is set, 0x00 otherwise
-inline uint32_t hi16x4(uint32_t bits4) { return ((bits4 * 0x00204081u) & 0x01010101u) << 4; }
-// 4 NVFP4 nibbles (one per byte, low 4 bits) -> 4 int8 values 2 * E2M1 = sign x {0, 1, 2, 3, 4, 6, 8, 12}
-inline int32_t fp4x4(uint32_t n) {
-    const uint32_t m = n & 0x07070707u;
-    const uint32_t gt4 = ((m + 0x03030303u) >> 3) & 0x01010101u;  // m > 4
-    const uint32_t eq7 = ((m + 0x01010101u) >> 3) & 0x01010101u;  // m == 7
-    const uint32_t mask = gt4 * 0xFFu;
-    const uint32_t v = m + ((m & mask) - (0x04040404u & mask)) + 2 * eq7;  // m, but 5 6 7 -> 6 8 12
-    // negate each byte safely without inter-byte borrow (v <= 12 < 128; -0 stays 0)
-    const uint32_t neg = (0x80808080u - v) ^ 0x80808080u;
-    const uint32_t smask = ((n >> 3) & 0x01010101u) * 0xFFu;
-    return (int32_t) (v ^ ((v ^ neg) & smask));
-}
-// apply 8 sign bits to 8 grid bytes (each <= 0x2b, so the negation stays inside its byte)
-inline int32_t signed4(uint32_t g, uint32_t m) { return (int32_t) ((g ^ m) + (m & 0x01010101u)); }
 
 // One 32-value block (ib) of a codebook row . int8 x. Rows split into these units balance over the 16 lanes far
 // better than whole 64/128-value steps (an IQ1_S row of 2304 has 18 steps: 2 lanes would do double work).
@@ -75,27 +49,9 @@ template <uint32_t T> inline UnitRaw unit_load(const RowRef rr, int ib) {
     }
     return u;
 }
-inline float h2f_bits(uint16_t b) { return (float) sycl::bit_cast<sycl::half>(b); }
-
-inline float nvfp4_q8_dot(const RowRef rr, int ub, const sycl::int4 x0, const sycl::int4 x1) {
-    using sycl::ext::oneapi::dot_acc;
-    const uint32_t * wp = (const uint32_t *) (rr.p + 16 * ub);
-    const uint32_t w0 = wp[0], w1 = wp[1], w2 = wp[2], w3 = wp[3];
-    int32_t is0 = dot_acc(fp4x4(w0), x0[0], 0);
-    is0 = dot_acc(fp4x4(w1), x0[1], is0);
-    is0 = dot_acc(fp4x4(w0 >> 4), x0[2], is0);
-    is0 = dot_acc(fp4x4(w1 >> 4), x0[3], is0);
-    int32_t is1 = dot_acc(fp4x4(w2), x1[0], 0);
-    is1 = dot_acc(fp4x4(w3), x1[1], is1);
-    is1 = dot_acc(fp4x4(w2 >> 4), x1[2], is1);
-    is1 = dot_acc(fp4x4(w3 >> 4), x1[3], is1);
-    const uint16_t sc = *(const uint16_t *) (rr.a + 2 * ub);
-    return q::ue4m3((uint8_t) (sc & 0xFFu)) * (float) is0 + q::ue4m3((uint8_t) (sc >> 8)) * (float) is1;
-}
 
 template <uint32_t T>
 inline float unit_dot(const UnitRaw & u, const sycl::int4 x0, const sycl::int4 x1, float xdb, float xsb, const q::Tabs & tb) {
-    using sycl::ext::oneapi::dot_acc;
     if constexpr (T == q::IQ1_SR) {
         const uint32_t w = u.w0, qh = u.aux;
         const float dl = h2f_bits(u.d) * (float) (2 * ((qh >> 12) & 7) + 1);
@@ -106,8 +62,8 @@ inline float unit_dot(const UnitRaw & u, const sycl::int4 x0, const sycl::int4 x
             const uint32_t * g32 = (const uint32_t *) tb.iq1s + 2 * (((w >> (8 * l)) & 0xFF) | (((qh >> (3 * l)) & 7) << 8));
             const uint32_t glo = g32[0], ghi = g32[1];
             const int32_t xa = l < 2 ? x0[2 * l] : x1[2 * l - 4], xb = l < 2 ? x0[2 * l + 1] : x1[2 * l - 3];
-            isum = dot_acc((int32_t) glo, xa, isum);
-            isum = dot_acc((int32_t) ghi, xb, isum);
+            isum = dp4a((int32_t) glo, xa, isum);
+            isum = dp4a((int32_t) ghi, xb, isum);
         }
         return dl * (xdb * (float) isum + delta * xsb);
     } else {
@@ -130,8 +86,8 @@ inline float unit_dot(const UnitRaw & u, const sycl::int4 x0, const sycl::int4 x
             }
             const uint32_t glo = g32[0], ghi = g32[1];
             const int32_t xa = l < 2 ? x0[2 * l] : x1[2 * l - 4], xb = l < 2 ? x0[2 * l + 1] : x1[2 * l - 3];
-            int32_t t = dot_acc(signed4(glo, byte_mask4(signs & 0xF)), xa, 0);
-            t = dot_acc(signed4(ghi, byte_mask4(signs >> 4)), xb, t);
+            int32_t t = dp4a(signed4(glo, byte_mask4(signs & 0xF)), xa, 0);
+            t = dp4a(signed4(ghi, byte_mask4(signs >> 4)), xb, t);
             part[l / 2] += t;
         }
         float db0, db1;
@@ -151,26 +107,26 @@ template <uint32_t T>
 inline float unit_q8x(const RowRef rr, int ib, const sycl::int4 x0, const sycl::int4 x1, float xdb, float xsb, const q::Tabs & tb) {
     if constexpr (T == q::NVFP4R) {
         return xdb * nvfp4_q8_dot(rr, ib, x0, x1);
+    } else if constexpr (T == q::Q4_KR) {
+        const int b = ib / 8, j = ib % 8, g = j / 2, sh = (j & 1) ? 4 : 0;
+        const uint32_t * wp = (const uint32_t *) (rr.p + b * 128 + g * 32);
+        const uint16_t sm = *(const uint16_t *) (rr.a + ib * 2);
+        const uint32_t dd = *(const uint32_t *) (rr.a2 + b * 4);
+        const float d = h2f_bits((uint16_t) (dd & 0xFFFFu));
+        const float dmin = h2f_bits((uint16_t) (dd >> 16));
+        int32_t isum = 0;
+        for (int k = 0; k < 4; ++k) isum = dp4a((int32_t) ((wp[k] >> sh) & 0x0F0F0F0Fu), x0[k], isum);
+        for (int k = 0; k < 4; ++k) isum = dp4a((int32_t) ((wp[4 + k] >> sh) & 0x0F0F0F0Fu), x1[k], isum);
+        return d * (float) (sm & 0xFFu) * xdb * (float) isum - dmin * (float) (sm >> 8) * xsb;
     } else if constexpr (T == q::Q5_KR) {
-        using sycl::ext::oneapi::dot_acc;
         const uint32_t * wp = (const uint32_t *) (rr.p + 16 * ib);
-        const uint32_t w0 = wp[0], w1 = wp[1], w2 = wp[2], w3 = wp[3];
         const uint32_t qh = *(const uint32_t *) (rr.a + 8 * ib);
         const uint16_t sm = *(const uint16_t *) (rr.a + 8 * ib + 4);
         const uint32_t dd = *(const uint32_t *) (rr.a2 + (ib / 8) * 4);
         const float d = h2f_bits((uint16_t) (dd & 0xFFFFu));
         const float dmin = h2f_bits((uint16_t) (dd >> 16));
-        const float sc = (float) (sm & 0xFFu);
-        const float mn = (float) (sm >> 8);
-        int32_t isum = dot_acc((int32_t) ((w0 & 0x0F0F0F0Fu) | hi16x4(qh & 0xFu)), x0[0], 0);
-        isum = dot_acc((int32_t) ((w1 & 0x0F0F0F0Fu) | hi16x4((qh >> 4) & 0xFu)), x0[1], isum);
-        isum = dot_acc((int32_t) ((w2 & 0x0F0F0F0Fu) | hi16x4((qh >> 8) & 0xFu)), x0[2], isum);
-        isum = dot_acc((int32_t) ((w3 & 0x0F0F0F0Fu) | hi16x4((qh >> 12) & 0xFu)), x0[3], isum);
-        isum = dot_acc((int32_t) (((w0 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 16) & 0xFu)), x1[0], isum);
-        isum = dot_acc((int32_t) (((w1 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 20) & 0xFu)), x1[1], isum);
-        isum = dot_acc((int32_t) (((w2 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 24) & 0xFu)), x1[2], isum);
-        isum = dot_acc((int32_t) (((w3 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 28) & 0xFu)), x1[3], isum);
-        return d * sc * xdb * (float) isum - dmin * mn * xsb;
+        const int32_t isum = q5_q8_isum(wp, qh, x0, x1);
+        return d * (float) (sm & 0xFFu) * xdb * (float) isum - dmin * (float) (sm >> 8) * xsb;
     } else {
         return unit_dot<T>(unit_load<T>(rr, ib), x0, x1, xdb, xsb, tb);
     }
@@ -628,9 +584,7 @@ template <uint32_t T, bool STAGE> sycl::event k_down8(sycl::queue & q, const Pro
     });
 }
 
-// ---- expert down with int8 activations (DP4A), for NVFP4R and Q2_0R
-
-template <uint32_t T> constexpr bool has_down_q8() { return T == q::NVFP4R || T == q::Q2_0R; }
+// ---- expert down with int8 activations (DP4A), for NVFP4R, Q2_0R, and Q5_0R
 
 // ---- hot-expert cache (offload): the chosen experts that are cached in VRAM, computed on the GPU while the CPU
 // computes the others. Routing split: slot (or -1) per chosen expert for the GPU, expert (or -1) for the CPU.
@@ -730,15 +684,19 @@ sycl::event k_quant_act(sycl::queue & q, const float * x, int n, bool perm, int8
 
 // one 32-value block ub of an expert row . int8 x, as a float (before the activation and expert scales)
 template <uint32_t T> inline float down_unit(const RowRef rr, int ub, const sycl::int4 x0, const sycl::int4 x1, float xqs) {
-    using sycl::ext::oneapi::dot_acc;
     if constexpr (T == q::NVFP4R) {
         return nvfp4_q8_dot(rr, ub, x0, x1);
+    } else if constexpr (T == q::Q5_0R) {
+        const uint32_t * wp = (const uint32_t *) (rr.p + 16 * ub);
+        const uint32_t qh = *(const uint32_t *) (rr.a + 4 * ub);
+        const int32_t is = q5_q8_isum(wp, qh, x0, x1);
+        return q::f16(rr.a2 + 2 * ub) * (float) (is - 16 * (int32_t) xqs);
     } else {  // Q2_0R: 16-value words, field k at bits 2k = value k; x permuted by k_quant_act
         const int32_t X[8] = {x0[0], x0[1], x0[2], x0[3], x1[0], x1[1], x1[2], x1[3]};
         const sycl::uint2 wv = *(const sycl::uint2 *) (rr.p + 8 * ub);
         int32_t is = 0;
         for (int w = 0; w < 2; ++w)
-            for (int r = 0; r < 4; ++r) is = dot_acc((int32_t) ((wv[w] >> (2 * r)) & 0x03030303u), X[4 * w + r], is);
+            for (int r = 0; r < 4; ++r) is = dp4a((int32_t) ((wv[w] >> (2 * r)) & 0x03030303u), X[4 * w + r], is);
         return q::f16(rr.a + 2 * (ub / 2)) * (float) (is - (int32_t) xqs);  // stored 0..3 = value + 1
     }
 }
@@ -789,37 +747,6 @@ template <uint32_t T> sycl::event k_down_q8(sycl::queue & q, const DownQ8Args a8
             }
         }
     });
-}
-
-// Argmax over a work-group's (val, idx) pairs using sub-group XOR shuffles + SLM across RPG sub-groups.
-inline void wg_argmax(const sycl::nd_item<1> & it, float * sv, int32_t * si, float & bv, int32_t & bi) {
-    const auto sg = it.get_sub_group();
-    const int sgid = (int) sg.get_group_id()[0], lane = (int) sg.get_local_id()[0];
-    for (int off = SG / 2; off > 0; off /= 2) {
-        const float ov = sycl::permute_group_by_xor(sg, bv, off);
-        const int32_t oi = sycl::permute_group_by_xor(sg, bi, off);
-        if (ov > bv || (ov == bv && oi < bi)) {
-            bv = ov;
-            bi = oi;
-        }
-    }
-    if (lane == 0) {
-        sv[sgid] = bv;
-        si[sgid] = bi;
-    }
-    sycl::group_barrier(it.get_group());
-    if (sgid == 0) {
-        bv = lane < RPG ? sv[lane] : -INFINITY;
-        bi = lane < RPG ? si[lane] : (1 << 30);
-        for (int off = SG / 2; off > 0; off /= 2) {
-            const float ov = sycl::permute_group_by_xor(sg, bv, off);
-            const int32_t oi = sycl::permute_group_by_xor(sg, bi, off);
-            if (ov > bv || (ov == bv && oi < bi)) {
-                bv = ov;
-                bi = oi;
-            }
-        }
-    }
 }
 
 void k_argmax(sycl::queue & q, const float * x, int n, float * tmp_v, int32_t * tmp_i) {
@@ -904,10 +831,11 @@ std::vector<MvGroup> FastEngine::plan_mv(const std::vector<MvJob> & js) {
 namespace {
 const char * type_name(uint32_t t) {
     switch (t) {
-        case q::F32: return "F32"; case q::F16: return "F16"; case q::BF16: return "BF16"; case q::Q8_0: return "Q8_0";
+        case q::F32: return "F32"; case q::F16: return "F16"; case q::BF16: return "BF16"; case q::Q5_0: return "Q5_0"; case q::Q8_0: return "Q8_0";
         case q::Q4_K: return "Q4_K"; case q::Q5_K: return "Q5_K"; case q::Q6_K: return "Q6_K"; case q::IQ2_XXS: return "IQ2_XXS";
         case q::IQ2_XS: return "IQ2_XS"; case q::IQ3_XXS: return "IQ3_XXS"; case q::IQ1_S: return "IQ1_S"; case q::IQ2_S: return "IQ2_S";
         case q::IQ4_XS: return "IQ4_XS"; case q::MXFP4: return "MXFP4"; case q::NVFP4: return "NVFP4"; case q::Q2_0: return "Q2_0";
+        case q::Q5_0R: return "Q5_0R";
         case q::Q8_0R: return "Q8_0R";
         case q::Q6_KR: return "Q6_KR";
         case q::Q4_KR: return "Q4_KR"; case q::Q5_KR: return "Q5_KR"; case q::IQ2_XXSR: return "IQ2_XXSR"; case q::IQ2_XSR: return "IQ2_XSR";
@@ -943,7 +871,7 @@ void FastEngine::run_mv(const char * label0, const std::vector<MvGroup> & plan) 
 }
 
 FastEngine::FastEngine(sycl::queue & q, const Model & m, int n_ctx, bool use_graph, int prompt_chunk, int kv_bits)
-    : q_(q), m_(m), hp_(m.hp), n_ctx_(n_ctx), TB_(prompt_chunk) {
+    : q_(q), m_(m), hp_(m.hp), n_ctx_(n_ctx), TB_(prompt_chunk), vuse_graph_(use_graph) {
     if (const char * e = getenv("INK_KV")) kv_bits = atoi(e);
     if (kv_bits != 8 && kv_bits != 4) throw std::runtime_error("fast engine: KV cache bits must be 8 or 4");
     kv4_ = kv_bits == 4;
@@ -1551,7 +1479,6 @@ void FastEngine::visit(const Visit & v) {
                     const int idx = ring ? k % ring : k;
                     const size_t kbase = ((size_t) kvh * kvlen + idx) * HD;
                     // K . q with DP4A: per 32-value block an int32 dot, then the K and q scales
-                    using sycl::ext::oneapi::dot_acc;
                     float dot[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                     for (int b = 0; b < HD / 32; ++b) {
                         const float ds = (float) ksc[kbase / 32 + b];
@@ -1573,7 +1500,7 @@ void FastEngine::visit(const Visit & v) {
                         for (int j = 0; j < ratio; ++j) {
                             const int32_t * qw = &sq8[(j * HD + 32 * b) / 4];
                             int32_t is = 0;
-                            for (int w = 0; w < 8; ++w) is = dot_acc(kw[w], qw[w], is);
+                            for (int w = 0; w < 8; ++w) is = dp4a(kw[w], qw[w], is);
                             const float val = kv4 ? (float) is - 8.0f * sqs[j * (HD / 32) + b] : (float) is;  // nibble - 8
                             dot[j] += ds * sqd[j * (HD / 32) + b] * val;
                         }
@@ -1989,17 +1916,7 @@ const std::vector<float> & FastEngine::step(int token, int pos) {
     run_step(token, pos);
     logits_.resize(hp_.n_vocab);
     q_.memcpy(logits_.data(), logits_dev_, hp_.n_vocab * sizeof(float)).wait();
-    if (profile && !prof_events_.empty()) {
-        for (auto & [label, e] : prof_events_) {
-            const double ms = (e.get_profiling_info<sycl::info::event_profiling::command_end>() -
-                               e.get_profiling_info<sycl::info::event_profiling::command_start>()) * 1e-6;
-            auto it = std::find_if(prof_ms_.begin(), prof_ms_.end(), [&](auto & p) { return p.first == label; });
-            if (it == prof_ms_.end()) prof_ms_.emplace_back(label, ms);
-            else it->second += ms;
-        }
-        prof_events_.clear();
-        ++prof_tokens_;
-    }
+    collect_profile();
     return logits_;
 }
 
@@ -2100,6 +2017,25 @@ bool FastEngine::is_swa_slot(int sl) const {
 
 void FastEngine::P(const char * label, sycl::event e) {
     if (profile) prof_events_.emplace_back(label, std::move(e));
+}
+
+void FastEngine::collect_profile() {
+    if (!profile || prof_events_.empty()) return;
+    for (auto & [label, e] : prof_events_) {
+        const double ms = (e.get_profiling_info<sycl::info::event_profiling::command_end>() -
+                           e.get_profiling_info<sycl::info::event_profiling::command_start>()) * 1e-6;
+        auto it = std::find_if(prof_ms_.begin(), prof_ms_.end(), [&](auto & p) { return p.first == label; });
+        if (it == prof_ms_.end()) prof_ms_.emplace_back(label, ms);
+        else it->second += ms;
+    }
+    prof_events_.clear();
+    ++prof_tokens_;
+}
+
+void FastEngine::reset_profile() {
+    prof_events_.clear();
+    prof_ms_.clear();
+    prof_tokens_ = 0;
 }
 
 void FastEngine::print_profile() const {

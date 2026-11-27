@@ -101,6 +101,16 @@ W load_impl(sycl::queue & q, const GgufFile & f, const std::string & name, bool 
             }
         });
     }
+    if (repack && t->type == q::Q5_0 && cols % 32 == 0) {
+        return planes(q::Q5_0R, n32 * 16, n32 * 4, n32 * 2, [&](const uint8_t * src, uint8_t * v, uint8_t * a, uint8_t * a2) {
+            for (int64_t b = 0; b < n32; ++b) {
+                const uint8_t * blk = src + b * 22;
+                std::memcpy(a2 + b * 2, blk, 2);       // d
+                std::memcpy(a + b * 4, blk + 2, 4);    // qh
+                std::memcpy(v + b * 16, blk + 6, 16);  // qs
+            }
+        });
+    }
     if (repack && t->type == q::IQ2_S && cols % 256 == 0) {
         return planes(q::IQ2_SR, n32 * 8, n32 * 2, n256 * 2, [&](const uint8_t * src, uint8_t * v, uint8_t * a, uint8_t * a2) {
             for (int64_t b = 0; b < n256; ++b) {

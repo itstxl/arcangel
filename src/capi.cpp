@@ -80,6 +80,15 @@ int ink_verify(void * hp, const int32_t * toks, int n, int pos0, float * logits)
     });
 }
 
+int ink_verify_argmax(void * hp, const int32_t * toks, int n, int pos0, int32_t * out_toks) {
+    return guarded([&] {
+        auto * h = (Handle *) hp;
+        const auto out = h->eng->verify_argmax(std::vector<int>(toks, toks + n), pos0);
+        if (out_toks) std::memcpy(out_toks, out.data(), out.size() * sizeof(int32_t));
+        return 0;
+    });
+}
+
 // Early-exit logits (n_pass loop passes) for the token at pos, state left unchanged; then call ink_step.
 int ink_draft(void * hp, int32_t token, int pos, int n_pass, float * logits) {
     return guarded([&] {

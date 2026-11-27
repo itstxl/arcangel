@@ -12,7 +12,7 @@ namespace ink {
 const TypeInfo * type_info(uint32_t type) {
     // block sizes from ggml/src/ggml-common.h
     static const std::map<uint32_t, TypeInfo> table = {
-        {0, {"F32", 1, 4}},        {1, {"F16", 1, 2}},        {30, {"BF16", 1, 2}},
+        {0, {"F32", 1, 4}},        {1, {"F16", 1, 2}},        {6, {"Q5_0", 32, 22}},     {30, {"BF16", 1, 2}},
         {8, {"Q8_0", 32, 34}},     {12, {"Q4_K", 256, 144}},  {13, {"Q5_K", 256, 176}},
         {14, {"Q6_K", 256, 210}},  {16, {"IQ2_XXS", 256, 66}}, {17, {"IQ2_XS", 256, 74}},
         {18, {"IQ3_XXS", 256, 98}}, {19, {"IQ1_S", 256, 50}},  {22, {"IQ2_S", 256, 82}},

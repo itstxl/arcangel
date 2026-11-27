@@ -18,8 +18,10 @@
 
 namespace ink {
 
-struct MvJob;  // one matrix-vector job (kernels.h)
-struct BJob;   // one batched matrix-vector job (kernels.h)
+struct MvJob;     // one matrix-vector job (kernels.h)
+struct BJob;      // one batched matrix-vector job (kernels.h)
+struct VMvJob;    // one batched-decode matrix-vector job (kernels.h)
+struct VMvGroup;  // format-grouped VMvJobs (kernels.h)
 
 // Jobs of one weight format, launched as one format-specialised kernel.
 struct MvGroup {
@@ -56,7 +58,9 @@ public:
     // cache entries it wrote at `pos` are overwritten by the full step(token, pos) that follows.
     const std::vector<float> & draft(int token, int pos, int n_pass);
     static constexpr int VMAX = 16;
+    static constexpr int VFAST = 8;
     const std::vector<float> & verify(const std::vector<int> & tokens, int pos0);
+    std::vector<int32_t> verify_argmax(const std::vector<int> & tokens, int pos0);
     void commit(int keep);
     bool use_xmx = true;
     bool gate_up_r = true;  // multi-row codebook gate-up (A/B switch, env INK_GUR=0)
@@ -90,6 +94,7 @@ public:
     // Kernel timing by label (needs a queue from make_queue(true) and no graph); print_profile() reports
     // milliseconds per token for each label.
     bool profile = false;
+    void reset_profile();
     void print_profile() const;
 
     // Stage codebook tables in work-group local memory (A/B switch; set before the first step).
@@ -217,9 +222,46 @@ private:
     float ** vhist_ = nullptr;   // device copy of hist_ (the per-slot pointers), for commit
     void embed(int n);           // embedding rows of btok_[0..n) into bxa_
     std::vector<float> vlogits_host_;
+
+    // batched-decode verify path (VB in {2, 4, 8}, verify.cpp)
+    void ensure_vraw();
+    void init_verify();
+    VMvJob * vjobs(const std::vector<VMvJob> & js);
+    std::vector<VMvGroup> plan_vmv(const std::vector<VMvJob> & js);
+    template <int VB> void run_vmv(const char * label, const std::vector<VMvGroup> & plan);
+    template <int VB> void vvisit(const Visit & v);
+    template <int VB> void vrecord();
+    template <int VB> void build_vgraph(int bi);
+    bool can_fast_verify(int n) const;
+    int run_fast_verify(const std::vector<int> & tokens, int pos0);
+    const std::vector<float> & verify_prefill(const std::vector<int> & tokens, int pos0);
+
+    bool vuse_graph_ = true;
+    bool vready_ = false;
+    int max_vchunks_ = 0;
+    int32_t * vtok_ = nullptr, * vpos0_ = nullptr, * vntok_ = nullptr;
+    float * vxa_ = nullptr, * vxb_ = nullptr, * vprelude_ = nullptr, * vstore_ = nullptr;
+    float * vin_ = nullptr, * vinn_ = nullptr, * vmsg_ = nullptr, * vmsgn_ = nullptr, * vctl_ = nullptr, * vnin_ = nullptr;
+    float * vg_ = nullptr, * vproj_ = nullptr, * vqf_ = nullptr, * vrf_ = nullptr, * vatt_ = nullptr;
+    float * vf_ = nullptr, * vfraw_ = nullptr, * vfn_ = nullptr, * vo_ = nullptr;
+    int8_t * vfq_ = nullptr, * vaq_ = nullptr;
+    float * vfqd_ = nullptr, * vfqs_ = nullptr, * vaqd_ = nullptr, * vaqs_ = nullptr;
+    int8_t * vmxq_[3] = {};
+    float * vmxqd_[3] = {}, * vmxqs_[3] = {};
+    float * vact_ = nullptr, * vrouter_ = nullptr, * vwts_ = nullptr;
+    int32_t * vids_ = nullptr, * vpairs_ = nullptr, * vtiles_ = nullptr;
+    float * vpart_ = nullptr;
+    float * vargmax_val_ = nullptr;
+    int32_t * vargmax_idx_ = nullptr, * vargmax_out_ = nullptr;
+    std::vector<VMvJob *> vjob_cache_;
+    size_t vjob_next_ = 0;
+    bool vjobs_only_ = false;
+    std::unique_ptr<ExecGraph> vgraphs_[3];
+
     std::vector<std::pair<const char *, sycl::event>> prof_events_;
     std::vector<std::pair<std::string, double>> prof_ms_;  // label -> total ms
     int prof_tokens_ = 0;
+    void collect_profile();
 };
 
 }  // namespace ink

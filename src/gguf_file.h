@@ -11,7 +11,7 @@ namespace ink {
 
 // ggml type ids used by the Inkling files (ggml/include/ggml.h)
 enum class GgmlType : uint32_t {
-    F32 = 0, F16 = 1, Q8_0 = 8, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17,
+    F32 = 0, F16 = 1, Q5_0 = 6, Q8_0 = 8, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17,
     IQ3_XXS = 18, IQ1_S = 19, IQ2_S = 22, IQ4_XS = 23, BF16 = 30, MXFP4 = 39, NVFP4 = 40, Q2_0 = 42,
 };
 

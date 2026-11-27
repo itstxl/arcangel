@@ -3,6 +3,9 @@
 #pragma once
 
 #include <sycl/sycl.hpp>
+#ifdef __SYCL_DEVICE_ONLY__
+#include <sycl/ext/oneapi/dot_product.hpp>
+#endif
 
 #include <cmath>
 
@@ -74,9 +77,9 @@ template <class F> void dispatch_type(uint32_t t, F && f) {
 #define INK_T(x) \
     case q::x: f(TypeTag<q::x>{}); return;
     switch (t) {
-        INK_T(F32) INK_T(F16) INK_T(BF16) INK_T(Q8_0) INK_T(Q4_K) INK_T(Q5_K) INK_T(Q6_K) INK_T(IQ2_XXS)
+        INK_T(F32) INK_T(F16) INK_T(BF16) INK_T(Q5_0) INK_T(Q8_0) INK_T(Q4_K) INK_T(Q5_K) INK_T(Q6_K) INK_T(IQ2_XXS)
         INK_T(IQ2_XS) INK_T(IQ3_XXS) INK_T(IQ1_S) INK_T(IQ2_S) INK_T(IQ4_XS) INK_T(MXFP4) INK_T(NVFP4) INK_T(Q2_0)
-        INK_T(Q8_0R) INK_T(Q6_KR) INK_T(Q4_KR) INK_T(Q5_KR) INK_T(IQ2_XXSR) INK_T(IQ2_XSR) INK_T(IQ1_SR) INK_T(IQ2_SR)
+        INK_T(Q5_0R) INK_T(Q8_0R) INK_T(Q6_KR) INK_T(Q4_KR) INK_T(Q5_KR) INK_T(IQ2_XXSR) INK_T(IQ2_XSR) INK_T(IQ1_SR) INK_T(IQ2_SR)
         INK_T(NVFP4R) INK_T(Q2_0R)
     }
 #undef INK_T
@@ -291,6 +294,26 @@ inline float lane_dot(const RowRef rr, int cols, const float * x, const float * 
             acc += d1 * sum - m1 * xsum;
         }
         return acc;
+    } else if constexpr (T == q::Q5_0R) {
+        // 32 values per step: 16 bytes low nibbles (0..15 low, 16..31 high), u32 qh, f16 d
+        for (int s = lane; s < cols / 32; s += SG) {
+            const sycl::uint4 wv = *(const sycl::uint4 *) (row + 16 * s);
+            const uint32_t qh = *(const uint32_t *) (arow + 4 * s);
+            const float d = q::f16(rr.a2 + 2 * s);
+            const int c0 = 32 * s;
+            const float * xs = c0 < split ? x + c0 : x2 + (c0 - split);
+            float sum = 0.0f;
+            for (int w = 0; w < 4; ++w)
+                for (int k = 0; k < 4; ++k) {
+                    const uint32_t byte = (wv[w] >> (8 * k)) & 0xFFu;
+                    const int j = 4 * w + k;
+                    const int qlo = (int) ((byte & 0xFu) + ((qh >> j) & 1u ? 16u : 0u)) - 16;
+                    const int qhi = (int) ((byte >> 4) + ((qh >> (16 + j)) & 1u ? 16u : 0u)) - 16;
+                    sum += (float) qlo * xs[j] + (float) qhi * xs[16 + j];
+                }
+            acc += d * sum;
+        }
+        return acc;
     }
     if constexpr (T == q::Q6_KR) {
         // int8 values, 16 per lane per step, scale d * sc per 16 values
@@ -398,7 +421,7 @@ template <int N> inline void kv_get(const int8_t * q, bool kv4, size_t o, float 
 
 template <uint32_t T> constexpr int step_vals() {
     if constexpr (T == q::Q8_0R || T == q::Q6_KR) return 16;
-    else if constexpr (T == q::NVFP4R || T == q::Q4_KR || T == q::Q5_KR) return 32;
+    else if constexpr (T == q::NVFP4R || T == q::Q4_KR || T == q::Q5_KR || T == q::Q5_0R) return 32;
     else if constexpr (T == q::Q2_0R || T == q::IQ2_SR || T == q::IQ2_XXSR || T == q::IQ2_XSR) return 64;
     else if constexpr (T == q::IQ1_SR) return 128;
     else if constexpr (q::shape(T).elems == 1) return 16;
@@ -518,6 +541,18 @@ template <uint32_t T, class Emit> inline void step_decode(const RowRef rr, int s
                 emit(c0 + j, d1 * (float) ((byte & 0xFu) + ((qh >> j) & 1u ? 16u : 0u)) - m1);
                 emit(c0 + 16 + j, d1 * (float) ((byte >> 4) + ((qh >> (16 + j)) & 1u ? 16u : 0u)) - m1);
             }
+    } else if constexpr (T == q::Q5_0R) {
+        const int c0 = 32 * s;
+        const sycl::uint4 wv = *(const sycl::uint4 *) (row + 16 * s);
+        const uint32_t qh = *(const uint32_t *) (arow + 4 * s);
+        const float d = q::f16(rr.a2 + 2 * s);
+        for (int w = 0; w < 4; ++w)
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t byte = (wv[w] >> (8 * k)) & 0xFFu;
+                const int j = 4 * w + k;
+                emit(c0 + j, d * (float) ((int) ((byte & 0xFu) + ((qh >> j) & 1u ? 16u : 0u)) - 16));
+                emit(c0 + 16 + j, d * (float) ((int) ((byte >> 4) + ((qh >> (16 + j)) & 1u ? 16u : 0u)) - 16));
+            }
     } else if constexpr (q::shape(T).elems == 1) {
         const int c0 = 16 * s;
         for (int i = 0; i < 16; ++i) {
@@ -551,5 +586,132 @@ struct BJobs {
     int n = 0;
 };
 
+// ---------------------------------------------------------------------------------------------------
+// shared DP4A & argmax helpers (used by fast.cpp and verify.cpp)
+
+template <uint32_t T> constexpr bool has_q8() {
+    return T == q::IQ2_SR || T == q::IQ2_XXSR || T == q::IQ2_XSR || T == q::IQ1_SR || T == q::NVFP4R || T == q::Q4_KR || T == q::Q5_KR;
+}
+template <uint32_t T> constexpr bool has_down_q8() { return T == q::NVFP4R || T == q::Q2_0R || T == q::Q5_0R; }
+
+// 4 bits -> 4 bytes of 0xFF where the bit is set
+inline uint32_t byte_mask4(uint32_t n) { return ((n * 0x00204081u) & 0x01010101u) * 0xFFu; }
+// 4 bits -> 4 bytes of 0x10 (16) where the bit is set, 0x00 otherwise
+inline uint32_t hi16x4(uint32_t bits4) { return ((bits4 * 0x00204081u) & 0x01010101u) << 4; }
+// 4 NVFP4 nibbles (one per byte, low 4 bits) -> 4 int8 values 2 * E2M1 = sign x {0, 1, 2, 3, 4, 6, 8, 12}
+inline int32_t fp4x4(uint32_t n) {
+    const uint32_t m = n & 0x07070707u;
+    const uint32_t gt4 = ((m + 0x03030303u) >> 3) & 0x01010101u;  // m > 4
+    const uint32_t eq7 = ((m + 0x01010101u) >> 3) & 0x01010101u;  // m == 7
+    const uint32_t mask = gt4 * 0xFFu;
+    const uint32_t v = m + ((m & mask) - (0x04040404u & mask)) + 2 * eq7;  // m, but 5 6 7 -> 6 8 12
+    // negate each byte safely without inter-byte borrow (v <= 12 < 128; -0 stays 0)
+    const uint32_t neg = (0x80808080u - v) ^ 0x80808080u;
+    const uint32_t smask = ((n >> 3) & 0x01010101u) * 0xFFu;
+    return (int32_t) (v ^ ((v ^ neg) & smask));
+}
+// apply 8 sign bits to 8 grid bytes (each <= 0x2b, so the negation stays inside its byte)
+inline int32_t signed4(uint32_t g, uint32_t m) { return (int32_t) ((g ^ m) + (m & 0x01010101u)); }
+inline float h2f_bits(uint16_t b) { return (float) sycl::bit_cast<sycl::half>(b); }
+
+inline int32_t dp4a(int32_t a, int32_t b, int32_t c) {
+#ifdef __SYCL_DEVICE_ONLY__
+    return sycl::ext::oneapi::dot_acc(a, b, c);
+#else
+    for (int i = 0; i < 4; ++i) c += (int32_t) (int8_t) ((uint32_t) a >> (8 * i)) * (int32_t) (int8_t) ((uint32_t) b >> (8 * i));
+    return c;
+#endif
+}
+
+inline float nvfp4_q8_dot(const RowRef rr, int ub, const sycl::int4 x0, const sycl::int4 x1) {
+    const uint32_t * wp = (const uint32_t *) (rr.p + 16 * ub);
+    const uint32_t w0 = wp[0], w1 = wp[1], w2 = wp[2], w3 = wp[3];
+    int32_t is0 = dp4a(fp4x4(w0), x0[0], 0);
+    is0 = dp4a(fp4x4(w1), x0[1], is0);
+    is0 = dp4a(fp4x4(w0 >> 4), x0[2], is0);
+    is0 = dp4a(fp4x4(w1 >> 4), x0[3], is0);
+    int32_t is1 = dp4a(fp4x4(w2), x1[0], 0);
+    is1 = dp4a(fp4x4(w3), x1[1], is1);
+    is1 = dp4a(fp4x4(w2 >> 4), x1[2], is1);
+    is1 = dp4a(fp4x4(w3 >> 4), x1[3], is1);
+    const uint16_t sc = *(const uint16_t *) (rr.a + 2 * ub);
+    return q::ue4m3((uint8_t) (sc & 0xFFu)) * (float) is0 + q::ue4m3((uint8_t) (sc >> 8)) * (float) is1;
+}
+
+inline int32_t q5_q8_isum(const uint32_t * wp, uint32_t qh, const sycl::int4 x0, const sycl::int4 x1) {
+    const uint32_t w0 = wp[0], w1 = wp[1], w2 = wp[2], w3 = wp[3];
+    int32_t isum = dp4a((int32_t) ((w0 & 0x0F0F0F0Fu) | hi16x4(qh & 0xFu)), x0[0], 0);
+    isum = dp4a((int32_t) ((w1 & 0x0F0F0F0Fu) | hi16x4((qh >> 4) & 0xFu)), x0[1], isum);
+    isum = dp4a((int32_t) ((w2 & 0x0F0F0F0Fu) | hi16x4((qh >> 8) & 0xFu)), x0[2], isum);
+    isum = dp4a((int32_t) ((w3 & 0x0F0F0F0Fu) | hi16x4((qh >> 12) & 0xFu)), x0[3], isum);
+    isum = dp4a((int32_t) (((w0 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 16) & 0xFu)), x1[0], isum);
+    isum = dp4a((int32_t) (((w1 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 20) & 0xFu)), x1[1], isum);
+    isum = dp4a((int32_t) (((w2 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 24) & 0xFu)), x1[2], isum);
+    isum = dp4a((int32_t) (((w3 >> 4) & 0x0F0F0F0Fu) | hi16x4((qh >> 28) & 0xFu)), x1[3], isum);
+    return isum;
+}
+
+// Argmax over a work-group's (val, idx) pairs using sub-group XOR shuffles + SLM across RPG sub-groups.
+template <int Dim>
+inline void wg_argmax(const sycl::nd_item<Dim> & it, float * sv, int32_t * si, float & bv, int32_t & bi) {
+    const auto sg = it.get_sub_group();
+    const int sgid = (int) sg.get_group_id()[0], lane = (int) sg.get_local_id()[0];
+    for (int off = SG / 2; off > 0; off /= 2) {
+        const float ov = sycl::permute_group_by_xor(sg, bv, off);
+        const int32_t oi = sycl::permute_group_by_xor(sg, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    if (lane == 0) {
+        sv[sgid] = bv;
+        si[sgid] = bi;
+    }
+    sycl::group_barrier(it.get_group());
+    if (sgid == 0) {
+        bv = lane < RPG ? sv[lane] : -INFINITY;
+        bi = lane < RPG ? si[lane] : (1 << 30);
+        for (int off = SG / 2; off > 0; off /= 2) {
+            const float ov = sycl::permute_group_by_xor(sg, bv, off);
+            const int32_t oi = sycl::permute_group_by_xor(sg, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// batched-decode verify descriptors (Phase 1 speculative decoding, verify.cpp)
+
+constexpr int VFAST = 8;
+constexpr int V_MMAX = 4;
+
+struct VMvJob {
+    WRef w;
+    uint32_t type = 0;
+    int cols = 0, rows = 0, row0 = 0, split = 1 << 30;
+    const float * x = nullptr;
+    const float * x2 = nullptr;
+    size_t xs = 0;
+    float * y = nullptr;
+    size_t ys = 0;
+    float cap = 0.0f;
+    const int8_t * xq = nullptr;
+    const float * xd = nullptr, * xsum = nullptr;
+};
+
+struct VMvGroup {
+    uint32_t type = 0;
+    VMvJob * jobs = nullptr;
+    int n = 0;
+    int rows = 0;
+    int nx = 0;
+    const float * ux[3] = {};
+    size_t uxs[3] = {};
+    int ucols[3] = {};
+};
 
 }  // namespace ink

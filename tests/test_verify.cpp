@@ -39,10 +39,11 @@ int main(int argc, char ** argv) {
         }
         const int L = argc > 2 ? std::atoi(argv[2]) : 2000;
         const int n_ctx = argc > 3 ? std::atoi(argv[3]) : 8192;
+        const bool vprof = std::getenv("INK_VPROF") && std::string(std::getenv("INK_VPROF")) == "1";
         ink::GgufFile f(argv[1]);
-        sycl::queue q = ink::make_queue();
+        sycl::queue q = ink::make_queue(vprof);
         ink::Model model(q, f, true);
-        ink::FastEngine eng(q, model, n_ctx, true, 256, std::getenv("INK_KV") ? std::atoi(std::getenv("INK_KV")) : 4);
+        ink::FastEngine eng(q, model, n_ctx, !vprof, 256, std::getenv("INK_KV") ? std::atoi(std::getenv("INK_KV")) : 4);
         const size_t V = eng.hp().n_vocab;
 
         // a prompt of ordinary text-like tokens, then greedy decoding to get "drafts" the model agrees with
@@ -85,6 +86,51 @@ int main(int argc, char ** argv) {
             if (!top || k > 0.02) ++fails;
         }
         std::printf("verify vs one-at-a-time, positions 0-7: worst KL %.5f %s\n", worst, fails ? "MISMATCH" : "MATCH");
+
+        // verify_argmax must match argmax(verify) on 100% of positions across n in {1, 2, 4, 7, 8}
+        int fails_argmax = 0;
+        for (int nn : {1, 2, 4, 7, 8}) {
+            eng.restore(s0);
+            std::vector<int> d(draft.begin(), draft.begin() + nn);
+            const auto vref = eng.verify(d, L);
+            eng.commit(0);
+            eng.restore(s0);
+            const auto va = eng.verify_argmax(d, L);
+            eng.commit(0);
+            for (int i = 0; i < nn; ++i) {
+                if ((size_t) va[i] != argmax(vref.data() + (size_t) i * V, V)) ++fails_argmax;
+            }
+        }
+        std::printf("verify_argmax parity (n=1,2,4,7,8): %s (%d mismatches)\n",
+                    fails_argmax ? "MISMATCH" : "MATCH", fails_argmax);
+
+        if (vprof) {
+            eng.profile = true;
+            eng.restore(s0);
+            eng.step(seq[0], L);
+            eng.reset_profile();
+            for (int r = 0; r < 3; ++r) {
+                eng.restore(s0);
+                eng.step(seq[0], L);
+            }
+            std::printf("\n=== PROFILE decode step ===\n");
+            eng.print_profile();
+            for (int n : {2, 4, 8}) {
+                std::vector<int> d(seq.begin(), seq.begin() + n);
+                eng.restore(s0);
+                eng.verify(d, L);
+                eng.commit(0);
+                eng.reset_profile();
+                for (int r = 0; r < 3; ++r) {
+                    eng.restore(s0);
+                    eng.verify(d, L);
+                    eng.commit(0);
+                }
+                std::printf("\n=== PROFILE verify(%d) ===\n", n);
+                eng.print_profile();
+            }
+            return 0;
+        }
 
         // keep the 8 good tokens, then decode on: must match stepping seq one at a time
         eng.commit(8);
@@ -129,7 +175,7 @@ int main(int argc, char ** argv) {
             const double ms = time_it([&] { eng.verify(d, L); eng.commit(0); }, 10);
             std::printf("verify %2d tokens: %6.2f ms (%.2f decode steps)\n", n, ms, ms / step_ms);
         }
-        return fails || fails2 || fails3 ? 1 : 0;
+        return fails || fails2 || fails3 || fails_argmax ? 1 : 0;
     } catch (const std::exception & e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
