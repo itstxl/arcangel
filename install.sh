@@ -531,6 +531,9 @@ ARCANGEL_CTX=$ctx
 ARCANGEL_KV_BITS=$kv
 ARCANGEL_SETUP=$setup
 ARCANGEL_OFFLOAD=$offload
+# speculative decoding: copy drafting (no extra VRAM; ~1.5x on copied code, no loss elsewhere on a B580).
+# Off with offloading (not supported there). Or a DSpark draft GGUF path (slower than plain on discrete cards).
+ARCANGEL_SPEC=$([ -z "$offload" ] && echo copy)
 ARCANGEL_PORT=$port
 ARCANGEL_REASONING=low
 # ARCANGEL_STASH_RAM_GB=8   # host RAM for stashed conversations (default: a quarter of RAM)

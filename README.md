@@ -242,7 +242,19 @@ requests (titles, summaries) do not cost a full re-read. The stash is limited to
 **Reasoning effort** defaults to `low` (the model's own default is high and slow); requests can pass
 `reasoning_effort`.
 
-**Speculative decoding.** `server/inkling_server.py` supports two speculative modes (`--spec-draft-k 1..7`, with `K=3` recommended on Lunar Lake Arc 140V) using both greedy verification (`temp=0`) and lossless probabilistic rejection sampling (`temp > 0`), with mirrored target/draft snapshots across stash switches:
+**Speculative decoding** (by [alpha2beta](https://github.com/alpha2beta)). The installer turns on copy drafting for
+the full-VRAM setups (`ARCANGEL_SPEC=copy` in `arcangel.env`): when the model starts repeating text from the
+conversation (rewriting a file, quoting code in an edit) it guesses the next tokens from that text and checks
+them in one batch. Sampling stays exactly as without it. Measured on a B580 (Q2_K_XL, temperature 1):
+
+| | copy-heavy edit | prose |
+|---|---|---|
+| plain decoding | 64.4 tok/s | 65.0 tok/s |
+| copy drafting, K=3 (default) | **99.7 tok/s** | 65.2 tok/s |
+| DSpark drafter, K=3 | 83.4 tok/s | 42.3 tok/s |
+
+DSpark helps on the Lunar Lake iGPU (a slower target, see above) but not on discrete cards. Neither works with
+expert offloading (the server turns them off). The server supports two speculative modes (`--spec-draft-k 1..7`, with `K=3` recommended on Lunar Lake Arc 140V) using both greedy verification (`temp=0`) and lossless probabilistic rejection sampling (`temp > 0`), with mirrored target/draft snapshots across stash switches:
 
 ```bash
 # Native GPU DSpark (dflash) draft model (set INK_DSPARK_W2_Q8=0 to keep markov_w2 in BF16 instead of Q8_0R)
