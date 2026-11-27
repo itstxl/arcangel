@@ -77,10 +77,10 @@ Because Inkling 2 Mini routes **top-8 of 128 experts**, the distinct-expert shar
   1. Implement recorded batched-decode verify graphs (`VB ∈ {2, 4, 8}`) with dense batched GEMMs (`k_mv_batch`), parallel single-WG expert bucketing (`k_vgroup`), unpack-once DP4A grouped experts (`k_vgate_up_r`, `k_vdown_q8`), batched split-K attention (`k_vattn`, `k_vcombine`), fused conv/mix/ctrl glue kernels, and batched GPU `k_vargmax`.
   2. Expose `ink_verify_argmax` in [src/capi.cpp](src/capi.cpp) and wire gated n-gram copy drafting (`minmatch >= 8`, `K = 3` or `7`) with greedy + lossless probabilistic acceptance into [server/inkling_server.py](server/inkling_server.py).
   3. Validate numerical parity and speedups via `test-verify` and real request replay.
-- **Phase 2 — Native DSpark Drafter Support:**
-  1. Tap target hidden states at DSpark's `target_layers` visits (e.g., `[5, 23, 41, 48]`) into a small device buffer during `step()` and `verify()`.
-  2. Add `src/dspark.*` to load `dspark-Inkling-2-Mini-*.gguf` (`dflash` architecture) reusing target `tok_embd` and `output`, executing the 2–3 layer parallel backbone + low-rank serial Markov head + confidence head (dynamic $K \le 7$).
-  3. Plug DSpark into the Phase 1 verify/commit loop (optionally combined with copy drafting on low confidence).
+- **Phase 2 — Native DSpark Drafter Support** *(detailed spec: [dspark_phase2_design.md](dspark_phase2_design.md))*:
+  1. Tap target hidden states at DSpark's `target_layers` visits (`[5, 23, 41, 48]`) into a small device buffer during `prefill()`, `step()`, and `verify()`.
+  2. Add `src/dspark.*` to load `dspark-Inkling-2-Mini-Q8_0.gguf` (58-tensor mainline `dflash` architecture) reusing target `tok_embd` and `output`, executing KV context injection, the 3-layer NeoX-RoPE parallel backbone, and the rank-256 serial Markov RNN head (`K <= 7`).
+  3. Plug DSpark into the Phase 1 verify/commit loop (optionally combined with copy drafting).
 
 ---
 
