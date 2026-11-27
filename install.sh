@@ -461,6 +461,7 @@ else
     die "$gguf_name needs $((size >> 30)) GiB, $models_dir has $((free_b >> 30)) GiB free (use --models-dir)"
   echo "  downloading $gguf_name ($((size >> 20)) MiB) to $models_dir (resumes if interrupted)"
   ask "Download it now?" y || die "nothing downloaded; pass --model FILE to use your own copy"
+  "$venv/bin/python" -m pip install -q --disable-pip-version-check huggingface_hub
   "$venv/bin/hf" download "$GGUF_REPO" "$gguf_name" --local-dir "$models_dir" >/dev/null
   model=$models_dir/$gguf_name
   [ "$size" -gt 0 ] && [ "$(stat -c %s "$model")" != "$size" ] && die "download incomplete: run install.sh again to resume"
