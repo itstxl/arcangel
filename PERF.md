@@ -66,7 +66,25 @@ With 8-bit KV, the observed KL range was 0.0053–0.0513 before and 0.0065–0.0
 
 In a separate synthetic profile at position 130,048, full attention took 11.57 ms/token, about 41% of summed kernel time.
 Batching the per-head softmax reductions cut full attention to 11.31 ms/token but moved synthetic decode only from 28.88 to 29.07 tok/s; changing the work-group size and moving query quantization out of the attention kernel were slower.
-These trials were not kept, and the measured graph decode rate on the populated coding cache remains below the 5% improvement target.
+These trials were not kept.
+
+### Register-owned decode at 128k
+
+The full-attention KV8 path for three query heads per KV head loads each V value once per chunk and accumulates all three heads in FP32 registers before reducing eight partials, avoiding local float atomics.
+Sliding-window attention, KV4, and other query-to-KV head ratios keep the previous path.
+
+On the same populated 130,048-token coding prompt in a 131,072-token context, graph decode improved from **34.85 to 40.00 tok/s (+14.8%)** over packed XMX prefill alone.
+The new rate is the median of three 128-token decode runs restored from the same populated cache (39.99, 40.01, and 40.00 tok/s); the paired control ran once.
+Cold prefill stayed at 488.0 tok/s, append at about 347 tok/s, and VRAM usage was unchanged.
+At a 4,096-token prompt, the two-run decode median rose from 57.32 to 58.29 tok/s (+1.7%), with prefill and append within 0.1%.
+Top-1 matched the control at the prefix, append, and final decode checkpoints at both depths, with KL at most 0.00076.
+Against llama.cpp CPU, both KV8 builds matched all three top-1 checks in each of two short graph runs; with KV4 both builds had the same two matches and one mismatch.
+
+In a synthetic kernel profile at 130,048 tokens, full attention dropped from 11.57 to 7.93 ms/token (-31.5%).
+Prototypes for blocking K in the cache or scoring Q.K with XMX did not bring full-attention time down further and were not kept.
+
+Prompt-lookup speculation was not enabled: the existing prompt-path verifier took 499 ms for a nine-token batch on a populated 128k-context cache, versus about 274 ms for nine serial steps.
+Replaying proposals on one 512-token greedy coding completion indicated that this batch would need to verify in about 94 ms for a 20% overall gain after accounting for misses and rejected proposals.
 
 ## Lessons
 

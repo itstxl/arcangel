@@ -1417,6 +1417,7 @@ void FastEngine::visit(const Visit & v) {
         static const int att_dbg_env = getenv("INK_ATT_DBG") ? atoi(getenv("INK_ATT_DBG")) : 0;  // 1: skip scores, 2: skip P.V
         const int att_dbg = att_dbg_env;
         const int ch = chunk;
+        const bool share_v = !swa && !kv4 && ratio == 3 && !(att_dbg & 2);
         // one launcher, two work-group sizes: 128 threads for the sliding-window layers (<= 1024 keys, 64-key
         // chunks), 256 for full attention (measured 2026-11-24: 128 is better for SWA and short context, 256 at depth)
         auto run_attn = [&](auto awg_c) {
@@ -1427,6 +1428,7 @@ void FastEngine::visit(const Visit & v) {
             sycl::local_accessor<float, 1> sr(4 * 16, cgh);
             sycl::local_accessor<float, 1> sp(4 * FCH, cgh);
             sycl::local_accessor<float, 1> sa(4 * HD, cgh);  // ratio x HD output partials (local float atomics)
+            sycl::local_accessor<sycl::float4, 1> vpart(share_v ? 8 * 3 * HD / 4 : 1, cgh);
             sycl::local_accessor<int32_t, 1> sq8(4 * HD / 4, cgh);  // the queries as int8 (4 per word), see below
             sycl::local_accessor<float, 1> sqd(4 * HD / 32, cgh), sqs(4 * HD / 32, cgh);
             cgh.parallel_for(sycl::nd_range<1>((size_t) nkv * nc * AWG, AWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
@@ -1540,6 +1542,47 @@ void FastEngine::visit(const Visit & v) {
                     l[j] = sycl::reduce_over_group(grp, ps, sycl::plus<float>());
                 }
                 sycl::group_barrier(grp);
+                if constexpr (AWG == 256) {
+                    if (share_v) {
+                        // Each sub-group owns 64 output columns for one of eight key stripes.
+                        // Sharing each V load across the three query heads also avoids contended local atomics.
+                        const auto sg = it.get_sub_group();
+                        const int lane = (int) sg.get_local_id()[0], sgid = (int) sg.get_group_id()[0];
+                        const int stripe = sgid / 2, d = (sgid % 2) * 64 + lane * 4;
+                        const int nk = sycl::min(ch, pos - k0 + 1);
+                        const size_t base = ((size_t) kvh * kvlen + k0) * HD + d;
+                        float acc[3][4] = {};
+                        for (int k = stripe; k < nk; k += 8) {
+                            const size_t vi = base + (size_t) k * HD;
+                            const uint32_t raw = *(const uint32_t *) (vch + vi);
+                            const float ds = (float) vsc[vi / 32];
+                            const float w0 = sp[k] * ds, w1 = sp[FCH + k] * ds, w2 = sp[2 * FCH + k] * ds;
+                            for (int e = 0; e < 4; ++e) {
+                                const float val = (float) (int8_t) (raw >> (8 * e));
+                                acc[0][e] += w0 * val;
+                                acc[1][e] += w1 * val;
+                                acc[2][e] += w2 * val;
+                            }
+                        }
+                        for (int j = 0; j < 3; ++j)
+                            vpart[((stripe * 3 + j) * HD + d) / 4] = sycl::float4(acc[j][0], acc[j][1], acc[j][2], acc[j][3]);
+                        sycl::group_barrier(grp);
+                        if (t < HD) {
+                            const auto * p = reinterpret_cast<const float *>(vpart.template get_multi_ptr<sycl::access::decorated::no>().get());
+                            for (int j = 0; j < 3; ++j) {
+                                float * out = part + ((size_t) (h0 + j) * pstride + c) * (HD + 2);
+                                float sum = 0.0f;
+                                for (int r = 0; r < 8; ++r) sum += p[(r * 3 + j) * HD + t];
+                                out[2 + t] = sum;
+                                if (t == 0) {
+                                    out[0] = m[j];
+                                    out[1] = l[j];
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
                 // P . V: a sub-group per (query head, key group), each step 4 consecutive keys with a lane per (key,
                 // 32 dims): 16-byte loads, 256 contiguous bytes per sub-group (measured 2026-11-24: 8 dims per lane
                 // with one 64-byte key per step ran at ~74 GB/s; this is +8% decode at 90k, +4% at 30k)
