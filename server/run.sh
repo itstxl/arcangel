@@ -22,6 +22,10 @@ args=(--model "$model")
 [ -n "$ARCANGEL_HOST" ] && args+=(--host "$ARCANGEL_HOST")
 [ -n "$ARCANGEL_PORT" ] && args+=(--port "$ARCANGEL_PORT")
 [ -n "$ARCANGEL_REASONING" ] && args+=(--reasoning-effort "$ARCANGEL_REASONING")
+# speculative decoding: "copy" (prompt-lookup drafting: no extra VRAM, ~1.5x on copy-heavy output, no loss on
+# other text on a B580) or a DSpark draft GGUF path; ARCANGEL_SPEC_K guesses per step (default 3)
+if [ "$ARCANGEL_SPEC" = copy ]; then args+=(--spec-copy); elif [ -n "$ARCANGEL_SPEC" ]; then args+=(--spec-dspark "$ARCANGEL_SPEC"); fi
+[ -n "$ARCANGEL_SPEC_K" ] && args+=(--spec-draft-k "$ARCANGEL_SPEC_K")
 # offload recipe: these layers' routed experts stay in pinned system RAM (see cards.tsv)
 [ -n "$ARCANGEL_OFFLOAD" ] && export INK_OFFLOAD=$ARCANGEL_OFFLOAD
 [ -n "$ARCANGEL_STASH_RAM_GB" ] && args+=(--stash-ram-gb "$ARCANGEL_STASH_RAM_GB")

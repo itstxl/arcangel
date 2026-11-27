@@ -340,7 +340,7 @@ support (from source). Configure with `-DINK_LLAMA_TESTS=ON -DINK_LLAMA_DIR=path
 ```
 build/ref-dump $M ref/p1 "The capital of France is Paris. The capital of Germany is Berlin. The capital of Italy is" 2
 build/test-forward $M ref/p1 prefill        # also: ref | fast | graph; expect MATCH, KL ~0.001-0.002
-build/test-verify $M 2000 4                # batched verify parity & VB=2/4/8 timings (env INK_VPROF=1)
+INK_KV=4 build/test-verify $M 2000 8192     # batched verify parity & VB=2/4/8 timings (prompt, context; env INK_VPROF=1)
 build/test-dspark $M path/to/dspark.gguf   # tap parity, W2 BF16/Q8_0R draft match, snapshot restore
 tests/format_test.sh build $M ~/arcangel-format-test   # Q8_0 / Q5_K expert formats
 ```

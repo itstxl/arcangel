@@ -1059,7 +1059,10 @@ DsparkModel::DsparkModel(sycl::queue & q, const GgufFile & f, const Model & targ
     if (!w1t) throw std::runtime_error("dspark missing markov_w1.weight");
     hp.markov_rank = (int) w1t->ne[0];
     hp.n_vocab = (int) w1t->ne[1];
-    if (hp.n_vocab != target.hp.n_vocab) throw std::runtime_error("dspark vocab mismatch with target");
+    if (hp.n_vocab != target.hp.n_vocab)
+        throw std::runtime_error("dspark vocab (" + std::to_string(hp.n_vocab) + ") does not match the target's (" +
+                                 std::to_string(target.hp.n_vocab) + "): an older DSpark file? Use the current "
+                                 "dspark-Inkling-2-Mini-Q8_0.gguf from unsloth/Inkling-2-Mini-GGUF (the _Old one has no Markov head)");
     if (hp.markov_rank != 256) throw std::runtime_error("dspark expects markov_rank == 256");
 
     uint64_t total_need = 0;

@@ -519,6 +519,13 @@ class Server:
         dspark_path = getattr(args, "spec_dspark", None)
         if dspark_path and bool(getattr(args, "spec_copy", False)):
             raise ValueError("--spec-dspark and --spec-copy are mutually exclusive")
+        # The fast batched verify does not run with offloaded (CPU) experts, and the prompt-path fallback costs
+        # more than speculation saves: turn it off rather than run slower than plain decoding.
+        if (dspark_path or getattr(args, "spec_copy", False)) and os.environ.get("INK_OFFLOAD", "none") not in ("", "none"):
+            print("speculative decoding: off (not supported with expert offloading, INK_OFFLOAD)", flush=True)
+            dspark_path = None
+            args.spec_copy = False
+            args.spec_dspark = None
         t0 = time.time()
         self.eng = Engine(lib, args.model, args.n_ctx, args.chunk, args.kv_bits, args.stash_ram_gb, dspark_path=dspark_path)
         print(f"engine ready in {time.time() - t0:.1f} s: context {args.n_ctx}, {args.kv_bits}-bit KV cache, prompt chunk {self.eng.chunk}, vocab {self.eng.n_vocab}", flush=True)
