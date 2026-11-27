@@ -62,6 +62,18 @@ public:
     const std::vector<float> & verify(const std::vector<int> & tokens, int pos0);
     std::vector<int32_t> verify_argmax(const std::vector<int> & tokens, int pos0);
     void commit(int keep);
+
+    // Optional target hidden-state taps for native DSpark speculative decoding:
+    // tap-major layout [4][tap_cap()][D] storing visits 5, 23, 41 inputs + final output_norm output (48).
+    using TapCallback = std::function<void(const float * feats_dev, int cap, int n, int pos0)>;
+    void enable_taps(TapCallback prefill_cb = nullptr);
+    const float * tap_feats() const { return tgt_feats_; }
+    int tap_cap() const { return tap_cap_; }
+    bool taps_enabled() const { return tgt_feats_ != nullptr; }
+    const Model & model() const { return m_; }
+    sycl::queue & queue() const { return q_; }
+    int n_ctx() const { return n_ctx_; }
+
     bool use_xmx = true;
     bool gate_up_r = true;  // multi-row codebook gate-up (A/B switch, env INK_GUR=0)
     bool down_q8 = true;  // expert down with int8 activations (DP4A) for NVFP4 / Q2_0 (A/B switch, env INK_DOWNQ8=0)  // prompt matrix multiplies on the XMX units (A/B switch)
@@ -257,6 +269,10 @@ private:
     size_t vjob_next_ = 0;
     bool vjobs_only_ = false;
     std::unique_ptr<ExecGraph> vgraphs_[3];
+
+    float * tgt_feats_ = nullptr;  // [4][tap_cap_][D] when taps are enabled
+    int tap_cap_ = 0;
+    TapCallback tap_cb_;
 
     std::vector<std::pair<const char *, sycl::event>> prof_events_;
     std::vector<std::pair<std::string, double>> prof_ms_;  // label -> total ms

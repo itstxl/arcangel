@@ -47,7 +47,7 @@ T_STOP = "<|content_model_end_sampling|>"
 class Engine:
     SNAP_PROMPT, SNAP_ZERO = 0, 9
 
-    def __init__(self, lib_path, model, n_ctx, chunk, kv_bits=8, stash_ram_gb=None):
+    def __init__(self, lib_path, model, n_ctx, chunk, kv_bits=8, stash_ram_gb=None, dspark_path=None):
         self.lib = ctypes.CDLL(str(lib_path))
         L = self.lib
         L.ink_open.restype = ctypes.c_void_p
@@ -64,6 +64,12 @@ class Engine:
         L.ink_commit.argtypes = [ctypes.c_void_p, ctypes.c_int]
         if hasattr(L, "ink_verify_argmax"):
             L.ink_verify_argmax.argtypes = [ctypes.c_void_p, i32p, ctypes.c_int, ctypes.c_int, i32p]
+        if hasattr(L, "ink_dspark_open"):
+            L.ink_dspark_open.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            L.ink_dspark_inject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            L.ink_dspark_draft_greedy.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int, ctypes.c_int, i32p]
+            L.ink_dspark_backbone.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int, ctypes.c_int]
+            L.ink_dspark_markov_step.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int32, f32p]
         L.ink_save.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         L.ink_restore.argtypes = [ctypes.c_void_p, ctypes.c_int]
         L.ink_stash.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
@@ -78,10 +84,20 @@ class Engine:
         self.logits = np.zeros(self.n_vocab, dtype=np.float32)
         self.lp = self.logits.ctypes.data_as(f32p)
         self._vlogits = None
+        self._dlogits = None
+        self.has_dspark = False
+        if dspark_path:
+            if not hasattr(L, "ink_dspark_open"):
+                raise RuntimeError("libinkling.so does not support --spec-dspark")
+            self.check(L.ink_dspark_open(self.h, str(dspark_path).encode()))
+            self.has_dspark = True
+            self._dlogits = np.zeros(self.n_vocab, dtype=np.float32)
+            self._dlp = self._dlogits.ctypes.data_as(f32p)
         self.tokens = []  # what the engine has processed, in order
-        # host RAM per stashed prompt token: 8 full-attention slots x K and V x 8 heads x 128 dims, plus the
-        # f16 scale per 32 values (the sliding-window slots add a fixed ~10-20 MB per stash)
-        self.stash_bpt = 8 * 2 * 1024 * (kv_bits / 8 + 2 / 32)
+        # host RAM per stashed prompt token: 8 full-attention slots x K and V x 8 heads x 128 dims (+1 slot if dspark),
+        # plus the f16 scale per 32 values (the sliding-window slots add a fixed ~10-20 MB per stash)
+        n_full_stash = 8 + (1 if self.has_dspark else 0)
+        self.stash_bpt = n_full_stash * 2 * 1024 * (kv_bits / 8 + 2 / 32)
         if stash_ram_gb is None:  # default: a quarter of the machine's RAM
             try:
                 kb = int(next(l for l in open("/proc/meminfo") if l.startswith("MemTotal")).split()[1])
@@ -127,6 +143,21 @@ class Engine:
 
     def commit(self, keep):
         self.check(self.lib.ink_commit(self.h, keep))
+
+    def dspark_inject(self, n, pos0):
+        self.check(self.lib.ink_dspark_inject(self.h, n, pos0))
+
+    def dspark_draft_greedy(self, last_tok, pos0, k):
+        out = (ctypes.c_int32 * k)()
+        self.check(self.lib.ink_dspark_draft_greedy(self.h, last_tok, pos0, k, out))
+        return [int(out[i]) for i in range(k)]
+
+    def dspark_backbone(self, last_tok, pos0, k):
+        self.check(self.lib.ink_dspark_backbone(self.h, last_tok, pos0, k))
+
+    def dspark_markov_step(self, slot, prev_tok):
+        self.check(self.lib.ink_dspark_markov_step(self.h, slot, prev_tok, self._dlp))
+        return self._dlogits
 
     # Whole conversations stashed in host RAM (full KV up to their prompt end), so a short unrelated request
     # (opencode's titles and summaries) does not cost the main conversation a full re-read.
@@ -305,6 +336,27 @@ def verify_accept_probabilistic(draft, vlogits, temperature, top_p, top_k, rng):
     return len(draft), sample(vlogits[len(draft)], temperature, top_p, top_k, rng)
 
 
+def verify_accept_spec_probabilistic(draft, draft_q, vlogits, temperature, top_p, top_k, rng):
+    """Lossless speculative rejection sampling given draft distribution q per slot (idx, probs)."""
+    for a, d in enumerate(draft):
+        idx_p, p = filtered_probs(vlogits[a], temperature, top_p, top_k)
+        idx_q, q = draft_q[a]
+        mp = np.nonzero(idx_p == d)[0]
+        p_d = float(p[mp[0]]) if mp.size else 0.0
+        mq = np.nonzero(idx_q == d)[0]
+        q_d = float(q[mq[0]]) if mq.size else 0.0
+        if q_d > 0.0 and rng.random() < min(1.0, p_d / q_d):
+            continue
+        q_map = dict(zip(idx_q.tolist(), q.tolist()))
+        q_on_p = np.array([q_map.get(int(tid), 0.0) for tid in idx_p], dtype=np.float64)
+        res = np.maximum(0.0, p - q_on_p)
+        s = float(res.sum())
+        if s > 0.0:
+            return a, int(rng.choice(idx_p, p=res / s))
+        return a, int(rng.choice(idx_p, p=p))
+    return len(draft), sample(vlogits[len(draft)], temperature, top_p, top_k, rng)
+
+
 class PromptLookupDrafter:
     """N-gram suffix matcher over prompt + accepted tokens (never matches the live suffix itself)."""
 
@@ -464,8 +516,11 @@ class Server:
         self.ids = {s: self.tok.token_to_id(s) for s in (T_MODEL, T_THINK, T_TEXT, T_TOOL, T_END, T_STOP)}
         self.eos_id = self.tok.token_to_id("<|endoftext|>")
         lib = Path(args.lib) if args.lib else HERE.parent / "build" / "libinkling.so"
+        dspark_path = getattr(args, "spec_dspark", None)
+        if dspark_path and bool(getattr(args, "spec_copy", False)):
+            raise ValueError("--spec-dspark and --spec-copy are mutually exclusive")
         t0 = time.time()
-        self.eng = Engine(lib, args.model, args.n_ctx, args.chunk, args.kv_bits, args.stash_ram_gb)
+        self.eng = Engine(lib, args.model, args.n_ctx, args.chunk, args.kv_bits, args.stash_ram_gb, dspark_path=dspark_path)
         print(f"engine ready in {time.time() - t0:.1f} s: context {args.n_ctx}, {args.kv_bits}-bit KV cache, prompt chunk {self.eng.chunk}, vocab {self.eng.n_vocab}", flush=True)
         self.model_info = {
             "id": args.name,
@@ -510,6 +565,7 @@ class Server:
         stop_id = self.ids[T_STOP]
         eos_id = self.eos_id
         spec_copy = bool(getattr(self.args, "spec_copy", False))
+        spec_dspark = bool(getattr(self.args, "spec_dspark", None)) or bool(getattr(self.eng, "has_dspark", False))
         draft_k = int(getattr(self.args, "spec_draft_k", 3))
         min_match = int(getattr(self.args, "spec_min_match", 8))
         drafter = PromptLookupDrafter(toks, min_match=min_match) if spec_copy else None
@@ -535,18 +591,35 @@ class Server:
                 if gone():
                     finish = "cancelled"
                     break
+            draft = []
+            draft_q = None
             if drafter is not None:
                 drafter.append(t)
                 max_draft = min(draft_k, self.eng.n_ctx - pos - 2, max_new - n_gen - 1)
                 draft = drafter.propose(max_draft)
-            else:
-                draft = []
+            elif spec_dspark:
+                max_draft = min(draft_k, 7, self.eng.n_ctx - pos - 2, max_new - n_gen - 1)
+                if max_draft >= 1:
+                    if temp <= 0:
+                        draft = self.eng.dspark_draft_greedy(t, pos, max_draft)
+                    else:
+                        self.eng.dspark_backbone(t, pos, max_draft)
+                        draft_q = []
+                        prev = t
+                        for s_i in range(max_draft):
+                            dlogits = self.eng.dspark_markov_step(s_i, prev)
+                            idx_q, q_p = filtered_probs(dlogits, temp, top_p, top_k)
+                            prev = int(rng.choice(idx_q, p=q_p))
+                            draft.append(prev)
+                            draft_q.append((idx_q, q_p))
             if not draft:
                 if temp <= 0:
                     next_tok = self.eng.step_argmax(t, pos)
                 else:
                     self.eng.step(t, pos)
                     next_tok = sample(self.eng.logits, temp, top_p, top_k, rng)
+                if spec_dspark:
+                    self.eng.dspark_inject(1, pos)
                 self.eng.tokens.append(t)
                 pos += 1
             else:
@@ -556,19 +629,25 @@ class Server:
                     a, next_tok = verify_accept_greedy(draft, pred)
                 else:
                     vlogits = self.eng.verify(batch, pos)
-                    a, next_tok = verify_accept_probabilistic(draft, vlogits, temp, top_p, top_k, rng)
+                    if spec_dspark:
+                        a, next_tok = verify_accept_spec_probabilistic(draft, draft_q, vlogits, temp, top_p, top_k, rng)
+                    else:
+                        a, next_tok = verify_accept_probabilistic(draft, vlogits, temp, top_p, top_k, rng)
                 spec_steps += 1
                 spec_drafted += len(draft)
                 spec_accepted += a
                 stop_i = next((i for i, dt in enumerate(draft[:a]) if dt == stop_id or dt == eos_id), None)
                 if stop_i is not None:
                     self.eng.commit(stop_i + 1)
+                    if spec_dspark:
+                        self.eng.dspark_inject(stop_i + 1, pos)
                     self.eng.tokens.extend(batch[:stop_i + 1])
                     pos += stop_i + 1
                     for dt in draft[:stop_i]:
                         n_gen += 1
                         gen.append(dt)
-                        drafter.append(dt)
+                        if drafter is not None:
+                            drafter.append(dt)
                         parser.feed(dt)
                         for kind, val in parser.take():
                             emit(kind, val)
@@ -577,12 +656,15 @@ class Server:
                     finish = "stop"
                     break
                 self.eng.commit(a + 1)
+                if spec_dspark:
+                    self.eng.dspark_inject(a + 1, pos)
                 self.eng.tokens.extend(batch[:a + 1])
                 pos += a + 1
                 for dt in draft[:a]:
                     n_gen += 1
                     gen.append(dt)
-                    drafter.append(dt)
+                    if drafter is not None:
+                        drafter.append(dt)
                     parser.feed(dt)
                     for kind, val in parser.take():
                         emit(kind, val)
@@ -599,7 +681,7 @@ class Server:
         timing = {"prompt_tokens": len(toks), "prompt_processed": processed, "prompt_s": round(t1 - t0, 3),
                   "completion_tokens": n_gen, "gen_s": round(t2 - t1, 3),
                   "gen_tok_s": round(n_gen / max(t2 - t1, 1e-9), 2)}
-        if spec_copy:
+        if spec_copy or spec_dspark:
             timing["spec_steps"] = spec_steps
             timing["spec_drafted"] = spec_drafted
             timing["spec_accepted"] = spec_accepted
@@ -745,7 +827,8 @@ def main():
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--max-tokens", type=int, default=8192)
     ap.add_argument("--spec-copy", action="store_true", help="enable prompt-lookup copy-drafting speculative decoding")
-    ap.add_argument("--spec-draft-k", type=int, default=3, choices=(1, 3, 7), help="max draft tokens per speculative step (VB=2/4/8)")
+    ap.add_argument("--spec-dspark", default=None, help="path to dspark-Inkling-2-Mini GGUF for native speculative decoding")
+    ap.add_argument("--spec-draft-k", type=int, default=3, choices=range(1, 8), help="max draft tokens per speculative step (1..7)")
     ap.add_argument("--spec-min-match", type=int, default=8, help="minimum suffix match length for copy drafting")
     args = ap.parse_args()
     server = Server(args)

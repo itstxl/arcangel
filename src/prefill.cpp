@@ -1284,6 +1284,10 @@ const std::vector<float> & FastEngine::verify_prefill(const std::vector<int> & t
         embed(n);
         const auto & vs = m_.schedule.visits;
         for (size_t i = 0; i < vs.size(); ++i) {
+            if (tgt_feats_ && (i == 5 || i == 23 || i == 41)) {
+                const int tap = i == 5 ? 0 : (i == 23 ? 1 : 2);
+                P("b_tap", q_.memcpy(tgt_feats_ + (size_t) tap * tap_cap_ * D, bxa_, (size_t) n * D * sizeof(float)));
+            }
             bvisit(vs[i], n, pos0);
             if ((int) i + 1 == m_.schedule.prelude_end) P("b_prelude", q_.memcpy(bprelude_, bxa_, (size_t) n * D * sizeof(float)));
         }
@@ -1302,6 +1306,7 @@ const std::vector<float> & FastEngine::verify_prefill(const std::vector<int> & t
             a.normw[0] = m_.output_norm.f32();
             P("b_out", k_bmix(q_, a, 1));
         }
+        if (tgt_feats_) P("b_tap", q_.memcpy(tgt_feats_ + (size_t) 3 * tap_cap_ * D, bf_, (size_t) n * D * sizeof(float)));
         for (int r = 0; r < n; ++r) run_bmm("b_head", {bjob(m_.output, bf_ + (size_t) r * D, D, vlogits_ + (size_t) r * h.n_vocab, 0)}, 1);
     } catch (...) {
         verify_ = false;
@@ -1351,6 +1356,10 @@ const std::vector<float> & FastEngine::prefill(const std::vector<int> & tokens, 
         embed(n);
         const auto & vs = m_.schedule.visits;
         for (size_t i = 0; i < vs.size(); ++i) {
+            if (tgt_feats_ && (i == 5 || i == 23 || i == 41)) {
+                const int tap = i == 5 ? 0 : (i == 23 ? 1 : 2);
+                P("b_tap", q_.memcpy(tgt_feats_ + (size_t) tap * tap_cap_ * D, bxa_, (size_t) n * D * sizeof(float)));
+            }
             bvisit(vs[i], n, p0);
             if ((int) i + 1 == m_.schedule.prelude_end) P("b_prelude", q_.memcpy(bprelude_, bxa_, (size_t) n * D * sizeof(float)));
             if (bhook) {
@@ -1358,8 +1367,27 @@ const std::vector<float> & FastEngine::prefill(const std::vector<int> & tokens, 
                 bhook("l_out-" + std::to_string(vs[i].slot), bxa_, n);
             }
         }
-        // logits for the chunk's last token only: the output mix over its blocks, norm, LM head
-        if (c0 + n == tokens.size()) {
+        if (tgt_feats_) {
+            const size_t TD = (size_t) TB_ * D;
+            BMix a;
+            for (size_t s = 0; s < m_.schedule.out_blocks.size(); ++s) a.st[s] = bstore_ + (size_t) m_.schedule.out_blocks[s] * TD;
+            a.ns = (int) m_.schedule.out_blocks.size();
+            a.cur = bxa_;
+            a.qw = m_.output_res_query.f32();
+            a.nq = 1;
+            a.eps = h.eps;
+            a.out[0] = tgt_feats_ + (size_t) 3 * tap_cap_ * D;
+            a.normw[0] = m_.output_norm.f32();
+            P("b_out_tap", k_bmix(q_, a, n));
+            if (tap_cb_) tap_cb_(tgt_feats_, tap_cap_, n, p0);
+            if (c0 + n == tokens.size()) {
+                P("b_out_last", q_.memcpy(f_, tgt_feats_ + ((size_t) 3 * tap_cap_ + (size_t) (n - 1)) * D, D * sizeof(float)));
+                const W & o = m_.output;
+                BJob j = bjob(o, f_, D, logits_dev_, 0);
+                run_bmm("b_head", {j}, 1);
+            }
+        } else if (c0 + n == tokens.size()) {
+            // logits for the chunk's last token only: the output mix over its blocks, norm, LM head
             const size_t TD = (size_t) TB_ * D, last = (size_t) (n - 1) * D;
             BMix a;
             for (size_t s = 0; s < m_.schedule.out_blocks.size(); ++s) a.st[s] = bstore_ + (size_t) m_.schedule.out_blocks[s] * TD + last;

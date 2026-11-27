@@ -1208,6 +1208,17 @@ void FastEngine::prepare_jobs() {
     jobs_only_ = false;
 }
 
+void FastEngine::enable_taps(TapCallback prefill_cb) {
+    tap_cb_ = std::move(prefill_cb);
+    if (!tgt_feats_) {
+        tap_cap_ = std::max(TB_, VFAST);
+        tgt_feats_ = dev<float>((size_t) 4 * tap_cap_ * D);
+        q_.wait();
+    }
+    if (!graphs_.empty()) build_graph();
+    for (auto & g : vgraphs_) g.reset();
+}
+
 // ---------------------------------------------------------------------------------------------------
 // one layer visit
 
@@ -1819,7 +1830,12 @@ void FastEngine::record() {
     }
     const Schedule & sch = sched_ ? *sched_ : m_.schedule;
     const auto & vs = sch.visits;
+    const bool cap_taps = run && tgt_feats_ && !sched_;
     for (size_t i = 0; i < vs.size(); ++i) {
+        if (cap_taps && (i == 5 || i == 23 || i == 41)) {
+            const int tap = i == 5 ? 0 : (i == 23 ? 1 : 2);
+            P("tap", q_.memcpy(tgt_feats_ + (size_t) tap * tap_cap_ * D, xa_, (size_t) D * sizeof(float)));
+        }
         visit(vs[i]);
         if (run && (int) i + 1 == sch.prelude_end) P("prelude", q_.memcpy(prelude_, xa_, D * sizeof(float)));
         if (run && graphs_.empty() && hook) hook("l_out-" + std::to_string(vs[i].slot), xa_, D);
@@ -1838,6 +1854,7 @@ void FastEngine::record() {
     a.out[0] = f_;
     a.normw[0] = m_.output_norm.f32();
     P("out_mix", k_mix(q_, a));
+    if (cap_taps) P("tap", q_.memcpy(tgt_feats_ + (size_t) 3 * tap_cap_ * D, f_, (size_t) D * sizeof(float)));
     run_mv("head", head);
 }
 

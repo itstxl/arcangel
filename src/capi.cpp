@@ -2,6 +2,7 @@
 // decode calls returning logits, and prompt-cache snapshots. Errors return a negative value; ink_error()
 // says why.
 #include "device.h"
+#include "dspark.h"
 #include "fast.h"
 #include "gguf_file.h"
 #include "model.h"
@@ -19,6 +20,10 @@ struct Handle {
     std::unique_ptr<ink::Model> model;
     std::unique_ptr<ink::FastEngine> eng;
     std::map<int, ink::FastEngine::Snapshot> snaps;
+    std::unique_ptr<ink::GgufFile> dspark_file;
+    std::unique_ptr<ink::DsparkModel> dspark_model;
+    std::unique_ptr<ink::DsparkEngine> dspark;
+    std::map<int, ink::DsparkEngine::Snapshot> dspark_snaps;
 };
 
 thread_local std::string g_error;
@@ -105,6 +110,54 @@ int ink_commit(void * hp, int keep) {
     });
 }
 
+int ink_dspark_open(void * hp, const char * path) {
+    return guarded([&] {
+        auto * h = (Handle *) hp;
+        h->dspark_file = std::make_unique<ink::GgufFile>(path);
+        h->dspark_model = std::make_unique<ink::DsparkModel>(h->q, *h->dspark_file, *h->model);
+        h->dspark = std::make_unique<ink::DsparkEngine>(h->q, *h->model, *h->dspark_model,
+                                                        h->eng->n_ctx(), h->eng->kv_bits());
+        h->eng->enable_taps([d = h->dspark.get()](const float * feats, int cap, int n, int pos0) {
+            d->inject(feats, cap, n, pos0);
+        });
+        for (const auto & [id, snap] : h->snaps)
+            if (snap.pos == 0) h->dspark->save(h->dspark_snaps[id], 0);
+        return 0;
+    });
+}
+
+int ink_dspark_inject(void * hp, int n, int pos0) {
+    return guarded([&] {
+        auto * h = (Handle *) hp;
+        if (h->dspark) h->dspark->inject(h->eng->tap_feats(), h->eng->tap_cap(), n, pos0);
+        return 0;
+    });
+}
+
+int ink_dspark_draft_greedy(void * hp, int32_t last_tok, int pos0, int k, int32_t * out_toks) {
+    return guarded([&] {
+        auto * h = (Handle *) hp;
+        h->dspark->draft_greedy(last_tok, pos0, k, out_toks);
+        return 0;
+    });
+}
+
+int ink_dspark_backbone(void * hp, int32_t last_tok, int pos0, int k) {
+    return guarded([&] {
+        auto * h = (Handle *) hp;
+        h->dspark->draft_backbone(last_tok, pos0, k);
+        return 0;
+    });
+}
+
+int ink_dspark_markov_step(void * hp, int slot, int32_t prev_tok, float * out_logits) {
+    return guarded([&] {
+        auto * h = (Handle *) hp;
+        h->dspark->draft_markov_step(slot, prev_tok, out_logits);
+        return 0;
+    });
+}
+
 int ink_prefill(void * hp, const int32_t * toks, int n, int pos0, float * logits) {
     return guarded([&] {
         auto * h = (Handle *) hp;
@@ -133,6 +186,7 @@ int ink_save(void * hp, int id, int pos) {
     return guarded([&] {
         auto * h = (Handle *) hp;
         h->eng->save(h->snaps[id], pos);
+        if (h->dspark) h->dspark->save(h->dspark_snaps[id], pos);
         return 0;
     });
 }
@@ -144,6 +198,10 @@ int ink_restore(void * hp, int id) {
         auto it = h->snaps.find(id);
         if (it == h->snaps.end() || it->second.pos < 0) return -1;
         h->eng->restore(it->second);
+        if (h->dspark) {
+            auto dit = h->dspark_snaps.find(id);
+            if (dit != h->dspark_snaps.end() && dit->second.pos >= 0) h->dspark->restore(dit->second);
+        }
         return it->second.pos;
     });
 }
@@ -157,13 +215,23 @@ int ink_stash(void * hp, int src, int dst) {
         ink::FastEngine::Snapshot tmp;
         h->eng->stash(tmp, it->second);
         h->snaps[dst] = std::move(tmp);
+        if (h->dspark) {
+            auto dit = h->dspark_snaps.find(src);
+            if (dit != h->dspark_snaps.end() && dit->second.pos >= 0) {
+                ink::DsparkEngine::Snapshot dtmp;
+                h->dspark->stash(dtmp, dit->second);
+                h->dspark_snaps[dst] = std::move(dtmp);
+            }
+        }
         return 0;
     });
 }
 
 int ink_drop(void * hp, int id) {
     return guarded([&] {
-        ((Handle *) hp)->snaps.erase(id);
+        auto * h = (Handle *) hp;
+        h->snaps.erase(id);
+        h->dspark_snaps.erase(id);
         return 0;
     });
 }

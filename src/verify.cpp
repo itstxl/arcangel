@@ -1901,6 +1901,10 @@ void FastEngine::vrecord() {
     const Schedule & sch = m_.schedule;
     const auto & vs = sch.visits;
     for (size_t i = 0; i < vs.size(); ++i) {
+        if (run && tgt_feats_ && (i == 5 || i == 23 || i == 41)) {
+            const int tap = i == 5 ? 0 : (i == 23 ? 1 : 2);
+            P("v_tap", q_.memcpy(tgt_feats_ + (size_t) tap * tap_cap_ * D, vxa_, (size_t) VB * D * sizeof(float)));
+        }
         vvisit<VB>(vs[i]);
         if (run && (int) i + 1 == sch.prelude_end) P("v_prelude", q_.memcpy(vprelude_, vxa_, (size_t) VB * D * sizeof(float)));
     }
@@ -1918,6 +1922,7 @@ void FastEngine::vrecord() {
     a.out[0] = vf_;
     a.normw[0] = m_.output_norm.f32();
     P("v_out", (k_vmix<VB>(q_, a)));
+    if (tgt_feats_) P("v_tap", q_.memcpy(tgt_feats_ + (size_t) 3 * tap_cap_ * D, vf_, (size_t) VB * D * sizeof(float)));
     run_vmv<VB>("v_head", head);
 }
 

@@ -74,7 +74,11 @@ class MockEngine:
         self.committed_hist = []  # exact token sequence committed to conv history
         self.kv_slots = {}        # pos -> tok (simulates speculative KV overwrite + rollback)
         self.uncommitted_verify = False
-        self.calls = {"prefill": 0, "step": 0, "verify": 0, "commit": 0}
+        self.calls = {"prefill": 0, "step": 0, "verify": 0, "commit": 0, "dspark_inject": 0, "dspark_draft": 0}
+        self.has_dspark = False
+        self.dspark_injected_until = 0
+        self.dspark_draft_fn = None
+        self.dspark_logits_fn = None
 
     def _fill_logits(self, seq):
         if self.logits_fn is not None:
@@ -88,6 +92,7 @@ class MockEngine:
         self.tokens = list(toks)
         self.committed_hist = list(toks)
         self.kv_slots = {i: t for i, t in enumerate(toks)}
+        self.dspark_injected_until = len(toks)
         self._fill_logits(self.committed_hist)
         return len(toks)
 
@@ -134,14 +139,34 @@ class MockEngine:
         self.committed_hist.extend(self._pending_batch[:keep])
         self.uncommitted_verify = False
 
+    def dspark_inject(self, n, pos0):
+        assert pos0 == self.dspark_injected_until, f"inject pos0={pos0} != {self.dspark_injected_until}"
+        assert pos0 + n <= len(self.committed_hist), "inject past committed target hist"
+        self.calls["dspark_inject"] += 1
+        self.dspark_injected_until = pos0 + n
 
-def make_server(eng, tok, spec_copy=False, spec_draft_k=3, spec_min_match=8, max_tokens=256):
+    def dspark_draft_greedy(self, last_tok, pos0, k):
+        assert self.dspark_injected_until == pos0, f"draft pos0={pos0} != injected={self.dspark_injected_until}"
+        self.calls["dspark_draft"] += 1
+        return list(self.dspark_draft_fn(last_tok, pos0, k))
+
+    def dspark_backbone(self, last_tok, pos0, k):
+        assert self.dspark_injected_until == pos0
+        self.calls["dspark_draft"] += 1
+        self._dspark_pos0 = pos0
+
+    def dspark_markov_step(self, slot, prev_tok):
+        return self.dspark_logits_fn(self._dspark_pos0 + slot, prev_tok)
+
+
+def make_server(eng, tok, spec_copy=False, spec_dspark=None, spec_draft_k=3, spec_min_match=8, max_tokens=256):
     s = object.__new__(srv.Server)
     s.args = SimpleNamespace(
         reasoning_effort="low",
         max_tokens=max_tokens,
         temperature=0.0,
         spec_copy=spec_copy,
+        spec_dspark=spec_dspark,
         spec_draft_k=spec_draft_k,
         spec_min_match=spec_min_match,
     )
@@ -330,3 +355,63 @@ def test_lossless_probabilistic_rejection_sampling():
     empirical = counts / trials
     max_err = float(np.max(np.abs(empirical - expected)))
     assert max_err < 0.005, f"max distribution error {max_err:.5f}: empirical={empirical}, expected={expected}"
+
+
+def test_dspark_speculative_rejection_sampling():
+    rng = np.random.default_rng(777)
+    target_logits = np.array([2.4, 1.7, 0.9, -0.3, -2.5], dtype=np.float32)
+    draft_logits = np.array([1.1, 2.2, 1.5, 0.2, -1.0], dtype=np.float32)
+
+    idx_p, target_p = srv.filtered_probs(target_logits, temperature=1.0, top_p=0.95, top_k=5)
+    expected = np.zeros(5, dtype=np.float64)
+    for tid, pval in zip(idx_p, target_p):
+        expected[tid] = pval
+
+    idx_q, q_p = srv.filtered_probs(draft_logits, temperature=1.0, top_p=0.95, top_k=5)
+    vlogits = np.stack([target_logits, target_logits])
+
+    counts = np.zeros(5, dtype=np.int64)
+    trials = 120000
+    for _ in range(trials):
+        d = int(rng.choice(idx_q, p=q_p))
+        acc, nxt = srv.verify_accept_spec_probabilistic([d], [(idx_q, q_p)], vlogits, 1.0, 0.95, 5, rng)
+        emitted = d if acc == 1 else nxt
+        counts[emitted] += 1
+
+    empirical = counts / trials
+    max_err = float(np.max(np.abs(empirical - expected)))
+    assert max_err < 0.005, f"DSpark lossless rejection error {max_err:.5f}: emp={empirical}, exp={expected}"
+
+
+def test_dspark_server_loop_greedy_stop_and_prob():
+    prompt = [1, 3, 10, 11]
+    desired = [12, 13, 14, 15, 16, 6]  # ends cleanly at T_STOP (6) inside second verify round
+    tok = StubTokenizer({}, make_specials())
+    tok.encode = lambda p, add_special_tokens=False: SimpleNamespace(ids=list(prompt))
+
+    eng = MockEngine(20, 128, lambda seq: desired[len(seq) - len(prompt)] if len(seq) - len(prompt) < len(desired) else 6)
+    eng.has_dspark = True
+    # Imperfect drafter: misses 3rd token in first round (14 vs 19), perfect in second round hitting T_STOP (6)
+    eng.dspark_draft_fn = lambda last_tok, pos0, k: [13, 14, 19][:k] if pos0 == 4 else [16, 6, 18][:k]
+    s = make_server(eng, tok, spec_dspark="dummy.gguf", spec_draft_k=3)
+    res = s.generate({"messages": [], "temperature": 0.0}, lambda k, v: None)
+    assert res["finish"] == "stop"
+    assert res["timing"]["completion_tokens"] == len(desired)
+    assert res["timing"]["spec_steps"] == 2
+    assert eng.dspark_injected_until == len(prompt) + len(desired) - 1  # T_STOP is not committed
+    assert eng.committed_hist == prompt + desired[:-1]
+    assert not eng.uncommitted_verify
+
+    # Probabilistic mode with temperature=1.0 hitting max_tokens (keep non-special tokens 10..14 active)
+    probs_target = np.full(20, -30.0, dtype=np.float32)
+    probs_target[10:15] = np.array([2.0, 1.8, 1.2, 0.4, -0.5], dtype=np.float32)
+    eng2 = MockEngine(20, 128, None, logits_fn=lambda seq: probs_target)
+    eng2.has_dspark = True
+    eng2.dspark_logits_fn = lambda pos, prev: np.where((np.arange(20) >= 10) & (np.arange(20) < 15), probs_target + 0.3, -30.0).astype(np.float32)
+    s2 = make_server(eng2, tok, spec_dspark="dummy.gguf", spec_draft_k=3, max_tokens=10)
+    res2 = s2.generate({"messages": [], "temperature": 1.0, "max_tokens": 10}, lambda k, v: None)
+    assert res2["finish"] == "length"
+    assert res2["timing"]["completion_tokens"] == 10
+    assert res2["timing"]["spec_steps"] >= 2
+    assert eng2.dspark_injected_until == len(eng2.committed_hist)
+    assert not eng2.uncommitted_verify
