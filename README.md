@@ -50,6 +50,20 @@ Core Ultra 7 258V (8 Xe2 cores, 32 GB LPDDR5X-8533 UMA), `UD-Q4_K_M`, 32k contex
 | Prompt reading (2k prompt, `chunk=256 / 512`) | **198.2 / 225.8 tok/s** | ~46-49 tok/s |
 | Live server (`--chunk 512 --kv-bits 8`, greedy 512 tok) | **20.81 tok/s** | |
 
+#### Speculative decoding (Arc 140V, `Uncensored-Q4_K_M`, 4-bit KV)
+
+Batched-decode verify scaling (`test-verify`, `pos=2000`, `KV=4`): `1 tok` **`46.19 ms`** (`1.00x`), `VB=2` (`K=1`) **`64.03 ms`** (`1.39x`), `VB=4` (`K=3`) **`89.57 ms`** (`1.94x`), `VB=8` (`K=7`) **`144.00 ms`** (`3.12x`), with `worst KL 0.00519` and `verify_argmax: 0 mismatches`.
+
+| Workload | Mode | Throughput | Speedup | Acceptance (`tok/step`) |
+|---|---|---:|---:|---:|
+| Prose (`n_ctx=8192`, `effort=high`, 256 tok) | Baseline / **DSpark `K=3`** | `22.63` / **`21.89 tok/s`** | `0.97x` | `42.0%` (`2.26`) |
+| Code edit (`n_ctx=8192`, `effort=none`, 512 tok) | Baseline / **DSpark `K=3`** / `K=7` | `19.36` / **`23.40`** / `20.08 tok/s` | **`1.21x`** / `1.04x` | `69.6%` (`3.08`) / `48.5%` (`4.37`) |
+| Live `128k` server — code edit (`temp=0.0`) | **DSpark `K=7`** | **`30.01 tok/s`** | — | `70.4%` (`5.93`) |
+| Live `128k` server — Python refactor (`temp=1.0`) | **`--spec-copy K=3`** | **`29.57 tok/s`** | — | `98.4%` (`496/504`) |
+| Live `128k` server — 164-task HumanEval (`medium` think) | **DSpark `K=3`** | **`21.43 tok/s`** weighted (`21.89` mean) | — | **91.5%** Base / **88.4%** Plus |
+
+*(On HumanEval at `EVALPLUS_MAX_NEW_TOKENS=2048`, 13/14 base failures were `finish length` truncations from `reasoning_effort=medium`; 148/149 clean-stop tasks passed Base.)* See [arcangel_spec_decode.md](arcangel_spec_decode.md), [spec_decode_arcangel.md](spec_decode_arcangel.md), and [dspark_phase2_design.md](dspark_phase2_design.md).
+
 ## Install
 
 ```
@@ -140,7 +154,7 @@ because the desktop uses more VRAM), re-run the installer with a smaller `--ctx`
 Why these models:
 - Q8_K_XL is not used: its experts are the same NVFP4 as Q4_K_XL's in layers 0-19; it only widens the dense
   layers and layers 20-23 (already Q8_0 in Q4_K_XL) to BF16. So the B60 and B70 spend memory on context.
-- Q3_K_XL, IQ3_XXS and IQ4_XS use weight formats the engine does not support yet (Q3_K, IQ3_S, IQ4_NL, Q5_0).
+- Q3_K_XL, IQ3_XXS and IQ4_XS use weight formats the engine does not support yet (Q3_K, IQ3_S, IQ4_NL).
 
 ## Run with Docker
 
@@ -229,6 +243,18 @@ requests (titles, summaries) do not cost a full re-read. The stash is limited to
 **Reasoning effort** defaults to `low` (the model's own default is high and slow); requests can pass
 `reasoning_effort`.
 
+**Speculative decoding.** `server/inkling_server.py` supports two speculative modes (`--spec-draft-k 1..7`, with `K=3` recommended on Lunar Lake Arc 140V) using both greedy verification (`temp=0`) and lossless probabilistic rejection sampling (`temp > 0`), with mirrored target/draft snapshots across stash switches:
+
+```bash
+# Native GPU DSpark (dflash) draft model (set INK_DSPARK_W2_Q8=0 to keep markov_w2 in BF16 instead of Q8_0R)
+python3 server/inkling_server.py --model model.gguf --assets assets \
+  --n-ctx 131072 --chunk 512 --kv-bits 4 --spec-dspark dspark-Inkling-2-Mini-Q8_0.gguf --spec-draft-k 3
+
+# Zero-extra-VRAM prompt n-gram copy drafting (best for code refactoring/editing)
+python3 server/inkling_server.py --model model.gguf --assets assets \
+  --n-ctx 131072 --chunk 512 --kv-bits 4 --spec-copy --spec-draft-k 3
+```
+
 **VRAM.** The engine refuses to start rather than spill into system RAM. If it says there is not enough free
 VRAM, close other GPU programs (another model server, games) or lower the context. On a card that also drives
 your desktop, the desktop's use moves around: on the B580, 0.8-1.2 GB. The prompt chunk size (1024, 512, 256 or
@@ -267,6 +293,7 @@ layers run as 48 layer visits. The engine is SYCL C++ for Level Zero, with:
   bit-exact with ggml. Weights are repacked losslessly at load into layouts that suit the GPU.
 - **Prompt path** on the XMX matrix units: grouped expert GEMMs and flash attention.
 - **Decode path** as a recorded SYCL graph, with int8 DP4A experts and attention.
+- **Speculative decode & batched verify:** `src/verify.cpp` runs batched-decode verification in recorded SYCL graphs for `VB ∈ {2, 4, 8}` using unpack-once grouped DP4A MoE kernels; `src/dspark.cpp` runs the 3-mode GPU DSpark (`dflash` + rank-256 Markov head) draft model with 4-tap hidden-state capture (`[5, 23, 41, 48]`).
 - **K/V cache** in int8 or 4-bit, which is what makes 96k fit on 12 GB.
 
 Every change is checked against llama.cpp's CPU output (KL ~0.001-0.002, same top token). [SPEC.md](SPEC.md)
@@ -283,9 +310,11 @@ walks through the forward pass. [PERF.md](PERF.md) records what made it fast, wh
 | `src/engine.*` | naive reference forward pass (f32, one token at a time) |
 | `src/kernels.h` | shared kernel helpers: per-format row dot products and step decoders |
 | `src/fast.*` | `FastEngine`: decode (graph replay), K/V cache, snapshots |
+| `src/verify.cpp` | batched-decode speculative verify graphs (`VB ∈ {2, 4, 8}`), unpack-once DP4A MoE kernels |
+| `src/dspark.*` | native GPU DSpark (`dflash`) draft engine: tap capture, KV inject, backbone, Markov head |
 | `src/prefill.cpp` | the prompt path: XMX GEMMs, grouped XMX experts, XMX flash attention |
 | `src/capi.cpp` | C API, built as `build/libinkling.so` |
-| `tests/` | `test-forward` (logits vs llama.cpp), `test-dequant`, `gguf-retype` + `format_test.sh` |
+| `tests/` | `test-forward`, `test-verify`, `test-dspark`, `test-dequant`, CPU math & server spec tests |
 | `tools/` | `bench-decode`, `bench-prefill`, `ref-dump` (llama.cpp CPU answer key), `ink-probe` |
 | `bench/` | request-level benchmark against an OpenAI-compatible server |
 
@@ -312,6 +341,8 @@ support (from source). Configure with `-DINK_LLAMA_TESTS=ON -DINK_LLAMA_DIR=path
 ```
 build/ref-dump $M ref/p1 "The capital of France is Paris. The capital of Germany is Berlin. The capital of Italy is" 2
 build/test-forward $M ref/p1 prefill        # also: ref | fast | graph; expect MATCH, KL ~0.001-0.002
+build/test-verify $M 2000 4                # batched verify parity & VB=2/4/8 timings (env INK_VPROF=1)
+build/test-dspark $M path/to/dspark.gguf   # tap parity, W2 BF16/Q8_0R draft match, snapshot restore
 tests/format_test.sh build $M ~/arcangel-format-test   # Q8_0 / Q5_K expert formats
 ```
 
