@@ -1,0 +1,13 @@
+**
+!CMakeLists.txt
+!src/
+!src/**
+!tools/
+!tools/*.cpp
+!tests/
+!tests/*.cpp
+!server/
+!server/inkling_server.py
+!server/requirements.txt
+!server/chat_template.sha256
+!server/tokenizer.sha256

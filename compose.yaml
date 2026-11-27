@@ -1,0 +1,41 @@
+services:
+  arcangel:
+    image: arcangel
+    env_file: .env
+    build:
+      context: .
+      args:
+        INK_AOT_TARGETS: '${INK_AOT_TARGETS:-bmg_g21}'
+
+    user: '${RUN_UID:?Set RUN_UID}:${RUN_GID:?Set RUN_GID}'
+    group_add: ['${RENDER_GID:?Set RENDER_GID}']
+    devices:
+      - '${RENDER_NODE:-/dev/dri/renderD128}:${RENDER_NODE:-/dev/dri/renderD128}:rw'
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges=true]
+    # Offloaded experts use several GiB of pinned host RAM.
+    ulimits:
+      memlock:
+        soft: ${MEMLOCK_SOFT:--1}
+        hard: ${MEMLOCK_HARD:--1}
+
+    volumes:
+      - type: bind
+        source: '${MODELS_DIR:?Set MODELS_DIR}'
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false
+
+    ports:
+      - host_ip: '${HOST:-127.0.0.1}'
+        published: '8082'
+        target: 8082
+
+    command:
+      - --model
+      - '/models/${MODEL:-Inkling-2-Mini-UD-Q2_K_XL.gguf}'
+      - --n-ctx
+      - '${N_CTX:-98304}'
+      - --kv-bits
+      - '${KV_BITS:-4}'
