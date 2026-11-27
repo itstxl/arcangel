@@ -11,6 +11,7 @@ at the end of the last prompt and continues from there.
 """
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -25,9 +26,11 @@ from pathlib import Path
 
 import jinja2
 import numpy as np
+from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer
 
 HERE = Path(__file__).resolve().parent
+TEMPLATE_SHA256 = (HERE / "chat_template.sha256").read_text(encoding="ascii").strip()
 
 # special tokens of the Inkling 2 vocabulary
 T_MODEL = "<|message_model|>"
@@ -183,12 +186,15 @@ def _raise(msg):
 
 
 def load_template(path):
-    src = Path(path).read_text()
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != TEMPLATE_SHA256:
+        raise ValueError(f"SHA-256 checksum mismatch for chat template: {path}")
     # the Hugging Face {% generation %} block only marks assistant text for training; render its contents
-    src = re.sub(r"\{%-?\s*(end)?generation\s*-?%\}", "", src)
-    env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+    src = re.sub(r"\{%-?\s*(end)?generation\s*-?%\}", "", raw.decode("utf-8"))
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+    env.globals = {"namespace": env.globals["namespace"], "raise_exception": _raise}
+    env.filters = {name: env.filters[name] for name in ("dictsort", "float", "trim")}
     env.filters["tojson"] = _tojson
-    env.globals["raise_exception"] = _raise
     return env.from_string(src)
 
 
@@ -313,8 +319,8 @@ class Server:
     def __init__(self, args):
         self.args = args
         assets = Path(args.assets) if args.assets else HERE
-        self.tok = Tokenizer.from_file(str(assets / "tokenizer.json"))
         self.tmpl = load_template(assets / "chat_template.jinja")
+        self.tok = Tokenizer.from_file(str(assets / "tokenizer.json"))
         self.ids = {s: self.tok.token_to_id(s) for s in (T_MODEL, T_THINK, T_TEXT, T_TOOL, T_END, T_STOP)}
         lib = Path(args.lib) if args.lib else HERE.parent / "build" / "libinkling.so"
         t0 = time.time()
